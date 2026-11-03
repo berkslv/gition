@@ -12,7 +12,7 @@ use ratatui::layout::{Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
-use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
+use ratatui_textarea::{CursorMove, DataCursor, Input, Key, TextArea, WrapMode};
 use web_time::Instant;
 
 use crate::config::Config;
@@ -21,8 +21,9 @@ use crate::images::Images;
 use crate::keymap::{Action, Keymap};
 use crate::links;
 use crate::markdown::{self, Block};
+use crate::paste;
 use crate::paths;
-use crate::pointer::Target;
+use crate::pointer::{Selection, Target};
 use crate::repo::{self, INDEX};
 use crate::storage::Storage;
 use crate::sync::State;
@@ -58,11 +59,33 @@ pub struct Editor {
     pub path: PathBuf,
     eol: &'static str,
     saved: Vec<String>,
+    /// Pasted URLs waiting for their page title, with the row and column they start at.
+    titles: Vec<(String, usize, usize)>,
+    /// The lines with and without the last title swap, so that undo and redo take
+    /// its two edits (delete the URL, insert the link) as one.
+    swap: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl Editor {
     pub fn dirty(&self) -> bool {
         self.ta.lines() != self.saved.as_slice()
+    }
+
+    /// The selected text, if any is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((r0, c0), (r1, c1)) = self.ta.selection_range().filter(|(a, b)| a != b)?;
+        let lines = self.ta.lines();
+        let chars = |r: usize, from: usize, to: usize| -> String {
+            lines[r].chars().skip(from).take(to.saturating_sub(from)).collect()
+        };
+        Some(if r0 == r1 {
+            chars(r0, c0, c1)
+        } else {
+            let mut out = vec![chars(r0, c0, usize::MAX)];
+            out.extend(lines[r0 + 1..r1].iter().cloned());
+            out.push(chars(r1, 0, c1));
+            out.join("\n")
+        })
     }
 }
 
@@ -87,6 +110,8 @@ pub struct View {
     pub cursor: usize,
     pub rows: Vec<Row>,
     pub height: u16,
+    /// Where the rows were last drawn.
+    pub area: Rect,
 }
 
 pub enum PromptKind {
@@ -107,6 +132,8 @@ pub enum Modal {
     Prompt {
         title: String,
         input: String,
+        /// Byte offset of the cursor in `input`.
+        cursor: usize,
         kind: PromptKind,
     },
     ConfirmDelete {
@@ -121,6 +148,18 @@ pub enum Modal {
         sel: usize,
     },
     Help,
+    /// A shell command being typed, in the status bar.
+    Command {
+        input: String,
+        /// Byte offset of the cursor in `input`.
+        cursor: usize,
+    },
+    /// What a shell command printed.
+    Output {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
     /// Actions to pick by touch (see `pointer`).
     Menu {
         items: Vec<Action>,
@@ -146,6 +185,8 @@ pub struct App {
     pub modal: Modal,
     pub git: Option<State>,
     pub busy: bool,
+    /// A shell command is running.
+    pub running: bool,
     pub message: Option<(String, bool, Instant)>,
     pub images: Images,
     /// Page waiting for an image from the host's file picker.
@@ -156,6 +197,10 @@ pub struct App {
     pub quit: bool,
     /// What the last frame drew where, for pointer input.
     pub hits: Vec<(Rect, Target)>,
+    /// Text being selected with the mouse, or selected and copied.
+    pub selection: Option<Selection>,
+    /// A mouse button is down and has moved; `selection` is the one it's making.
+    pub(crate) dragging: bool,
     /// A touch screen: the status bar offers the menu instead of help.
     pub touch: bool,
     tx: Sender<Msg>,
@@ -163,7 +208,7 @@ pub struct App {
 }
 
 const GLOBAL: &[Action] =
-    &[Action::Quit, Action::Help, Action::Search, Action::Sync, Action::ToggleTree, Action::SwitchFocus];
+    &[Action::Quit, Action::Help, Action::Search, Action::Shell, Action::Sync, Action::ToggleTree, Action::SwitchFocus];
 const TREE: &[Action] = &[
     Action::Up,
     Action::Down,
@@ -191,8 +236,12 @@ const VIEW: &[Action] = &[
 ];
 const EDIT: &[Action] = &[
     Action::Save,
+    Action::SelectAll,
+    Action::Copy,
+    Action::Cut,
     Action::Undo,
     Action::Redo,
+    Action::PasteImage,
     Action::ExitEdit,
     Action::Sync,
     Action::ToggleTree,
@@ -230,6 +279,7 @@ impl App {
             modal: Modal::None,
             git: None,
             busy: false,
+            running: false,
             message: None,
             images,
             pending_image: None,
@@ -238,6 +288,8 @@ impl App {
             width: 80,
             quit: false,
             hits: Vec::new(),
+            selection: None,
+            dragging: false,
             touch: false,
             tx,
             rx,
@@ -273,9 +325,9 @@ impl App {
     /// Applies results from background work. Call once per loop iteration.
     pub fn tick(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
-            self.busy = false;
             match msg {
                 Msg::Fetched(state, pulled) => {
+                    self.busy = false;
                     self.git = Some(state);
                     if pulled > 0 {
                         self.refresh_after_pull();
@@ -283,12 +335,20 @@ impl App {
                     }
                 }
                 Msg::Synced(res, state) => {
+                    self.busy = false;
                     self.git = Some(state);
                     self.refresh_after_pull();
                     match res {
                         Ok(m) => self.info(m),
                         Err(m) => self.error(m),
                     }
+                }
+                Msg::Title(url, title) => self.title_arrived(&url, title),
+                Msg::Ran(cmd, res, state) => {
+                    self.running = false;
+                    self.git = Some(state);
+                    self.refresh_after_pull();
+                    self.command_done(cmd, res);
                 }
             }
         }
@@ -413,6 +473,7 @@ impl App {
     }
 
     pub fn load_page(&mut self, path: PathBuf) {
+        self.selection = None;
         let path = self.resolve_folder(&path);
         let kind = if self.fs.is_dir(&path) {
             PageKind::Folder
@@ -422,7 +483,7 @@ impl App {
         } else {
             match self.fs.read(&path) {
                 Ok(bytes) if !bytes.contains(&0) => match String::from_utf8(bytes) {
-                    Ok(s) if paths::is_markdown(&path) => PageKind::Markdown(markdown::render(&s)),
+                    Ok(s) if paths::is_markdown(&path) => PageKind::Markdown(markdown::render(&s, &self.cfg.theme)),
                     Ok(s) => PageKind::Text(s),
                     Err(_) => PageKind::Binary,
                 },
@@ -467,7 +528,8 @@ impl App {
         let mut ta = TextArea::new(lines.clone());
         ta.set_wrap_mode(WrapMode::WordOrGlyph);
         ta.set_cursor_line_style(Style::default());
-        self.editor = Some(Editor { ta, path, eol, saved: lines });
+        ta.set_selection_style(self.cfg.theme.selected());
+        self.editor = Some(Editor { ta, path, eol, saved: lines, titles: Vec::new(), swap: None });
         self.focus = Focus::Page;
     }
 
@@ -606,6 +668,7 @@ impl App {
         if k.key == Key::Null {
             return;
         }
+        self.selection = None;
         if !matches!(self.modal, Modal::None) {
             return self.modal_key(k);
         }
@@ -632,17 +695,98 @@ impl App {
     pub fn on_paste(&mut self, s: String) {
         let s = s.replace("\r\n", "\n");
         match &mut self.modal {
-            Modal::Prompt { input, .. } => input.push_str(s.lines().next().unwrap_or("")),
+            Modal::Prompt { input, cursor, .. } | Modal::Command { input, cursor } => {
+                let line = s.lines().next().unwrap_or("");
+                input.insert_str(*cursor, line);
+                *cursor += line.len();
+            }
             Modal::Search { query, .. } => {
                 query.push_str(s.lines().next().unwrap_or(""));
                 self.search_update();
             }
-            Modal::None if self.focus == Focus::Page => {
-                if let Some(e) = &mut self.editor {
-                    e.ta.insert_str(s);
+            // Some terminals paste nothing when the clipboard only holds an image.
+            Modal::None if self.focus == Focus::Page && self.editor.is_some() && s.is_empty() => {
+                if let Some(png) = self.host.paste_image() {
+                    self.paste_images(vec![("png", png)]);
+                }
+            }
+            Modal::None if self.focus == Focus::Page && self.editor.is_some() => {
+                if let Err(e) = self.paste(s) {
+                    self.error(e.to_string());
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Pastes into the editor: an image file's path imports the image, a bare URL
+    /// becomes a link once its page title arrives, anything else is typed as is.
+    fn paste(&mut self, s: String) -> Result<()> {
+        let Some(e) = &mut self.editor else { return Ok(()) };
+        if let Some(src) = paste::image_path(&s).filter(|p| p.is_file()) {
+            let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let page = e.path.clone();
+            return self.insert_image_bytes(&page, &name, &std::fs::read(&src)?);
+        }
+        let DataCursor(row, col) = e.ta.cursor();
+        let before: String = e.ta.lines()[row].chars().take(col).collect();
+        match paste::bare_url(&s).filter(|_| self.cfg.link_titles && !paste::in_link(&before)) {
+            Some(url) => {
+                e.ta.insert_str(url);
+                e.titles.push((url.to_string(), row, col));
+                self.host.fetch_title(url, self.tx.clone());
+            }
+            None => {
+                e.ta.insert_str(s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Swaps a pasted URL for `[title](url)` if it's still where it was pasted.
+    fn title_arrived(&mut self, url: &str, title: Option<String>) {
+        let Some(e) = &mut self.editor else { return };
+        let Some(i) = e.titles.iter().position(|(u, ..)| u == url) else { return };
+        let (_, row, col) = e.titles.remove(i);
+        let Some(title) = title else { return };
+        let len = url.chars().count();
+        let still = e.ta.lines().get(row).is_some_and(|l| l.chars().skip(col).take(len).eq(url.chars()));
+        if !still {
+            return;
+        }
+        let bare = e.ta.lines().to_vec();
+        let link = paste::link(&title, url);
+        let DataCursor(crow, ccol) = e.ta.cursor();
+        let at = |c: usize| CursorMove::Jump(row as u16, c as u16);
+        e.ta.cancel_selection();
+        e.ta.move_cursor(at(col));
+        e.ta.start_selection();
+        e.ta.move_cursor(at(col + len));
+        e.ta.insert_str(&link);
+        let ccol = if crow == row && ccol >= col + len { ccol + link.chars().count() - len } else { ccol };
+        e.ta.move_cursor(CursorMove::Jump(crow as u16, ccol as u16));
+        // Titles for other URLs pasted later on this line moved too.
+        for (_, r, c) in &mut e.titles {
+            if *r == row && *c > col {
+                *c = *c + link.chars().count() - len;
+            }
+        }
+        e.swap = Some((e.ta.lines().to_vec(), bare));
+    }
+
+    /// Pastes images from the clipboard into the editor, each on its own line.
+    pub fn paste_images(&mut self, images: Vec<(&str, Vec<u8>)>) {
+        let Some(page) = self.editor.as_ref().map(|e| e.path.clone()) else { return };
+        let secs = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for (i, (ext, bytes)) in images.iter().enumerate() {
+            if i > 0
+                && let Some(e) = &mut self.editor
+            {
+                e.ta.insert_newline();
+            }
+            if let Err(e) = self.insert_image_bytes(&page, &paste::image_name(ext, secs), bytes) {
+                return self.error(e.to_string());
+            }
         }
     }
 
@@ -657,6 +801,7 @@ impl App {
             }
             Action::Help => self.modal = Modal::Help,
             Action::Search => self.open_search(),
+            Action::Shell => self.modal = Modal::Command { input: String::new(), cursor: 0 },
             Action::Sync => self.sync(),
             Action::ToggleTree => self.toggle_tree(),
             Action::SwitchFocus => {
@@ -677,12 +822,30 @@ impl App {
     fn edit_key(&mut self, k: Input) {
         // Plain quit keys type text here; only the ones with a modifier quit.
         let quit = (k.ctrl || k.alt) && self.keys.is(Action::Quit, &k);
-        match self.action(&k, EDIT).or(quit.then_some(Action::Quit)) {
+        // Copy shares Ctrl+C with quit: it copies a selection, and quits without one.
+        let selected = self.editor.as_ref().is_some_and(|e| e.selected_text().is_some());
+        let action = self.action(&k, EDIT).filter(|&a| a != Action::Copy || selected);
+        match action.or(quit.then_some(Action::Quit)) {
             Some(a) => self.edit_action(a),
             None => {
-                if let Some(e) = &mut self.editor {
-                    e.ta.input(k);
+                // Alt+←/→ (Option on macOS) moves by word, like Ctrl+←/→.
+                let k = match k {
+                    Input { key: Key::Left | Key::Right, ctrl: false, alt: true, shift } => {
+                        Input { key: k.key, ctrl: true, alt: false, shift }
+                    }
+                    k => k,
+                };
+                let Some(e) = &mut self.editor else { return };
+                // ←/→ on a selection lands on its start or end, like other editors.
+                if let Input { key: key @ (Key::Left | Key::Right), ctrl: false, alt: false, shift: false } = k
+                    && let Some((start, end)) = e.ta.selection_range().filter(|(a, b)| a != b)
+                {
+                    let (row, col) = if key == Key::Left { start } else { end };
+                    e.ta.cancel_selection();
+                    e.ta.move_cursor(CursorMove::Jump(row as u16, col as u16));
+                    return;
                 }
+                e.ta.input(k);
             }
         }
     }
@@ -693,12 +856,41 @@ impl App {
                 Ok(()) => self.info("Saved"),
                 Err(e) => self.error(format!("Save failed: {e}")),
             },
+            Action::SelectAll => {
+                if let Some(e) = &mut self.editor {
+                    e.ta.select_all();
+                }
+            }
+            Action::Copy => {
+                let Some(text) = self.editor.as_ref().and_then(Editor::selected_text) else { return };
+                self.copy(&text);
+            }
+            Action::Cut => {
+                let Some(e) = &mut self.editor else { return };
+                let text = if e.ta.cut() { e.ta.yank_text() } else { cut_line(&mut e.ta) };
+                self.host.copy(&text);
+            }
             Action::Undo => {
-                self.editor.as_mut().map(|e| e.ta.undo());
+                if let Some(e) = &mut self.editor {
+                    let swapped = e.swap.as_ref().is_some_and(|(linked, _)| e.ta.lines() == linked.as_slice());
+                    e.ta.undo();
+                    if swapped {
+                        e.ta.undo();
+                    }
+                }
             }
             Action::Redo => {
-                self.editor.as_mut().map(|e| e.ta.redo());
+                if let Some(e) = &mut self.editor {
+                    let unswapped = e.swap.as_ref().is_some_and(|(_, bare)| e.ta.lines() == bare.as_slice());
+                    if e.ta.redo() && unswapped {
+                        e.ta.redo();
+                    }
+                }
             }
+            Action::PasteImage => match self.host.paste_image() {
+                Some(png) => self.paste_images(vec![("png", png)]),
+                None => self.info("No image on the clipboard"),
+            },
             Action::ExitEdit => {
                 if self.editor.as_ref().is_some_and(Editor::dirty) {
                     self.modal = Modal::SaveChanges(After::ExitEdit);
@@ -834,7 +1026,7 @@ impl App {
     }
 
     fn prompt(&mut self, title: &str, input: String, kind: PromptKind) {
-        self.modal = Modal::Prompt { title: title.into(), input, kind };
+        self.modal = Modal::Prompt { title: title.into(), cursor: input.len(), input, kind };
     }
 
     fn modal_key(&mut self, k: Input) {
@@ -855,31 +1047,44 @@ impl App {
                 }
                 _ => self.modal = Modal::Menu { items, sel },
             },
-            Modal::Prompt { title, mut input, kind } => match k.key {
+            Modal::Prompt { title, mut input, mut cursor, kind } => match k.key {
                 Key::Esc => {}
                 Key::Enter => {
                     if let Err(e) = self.submit(kind, input.trim()) {
                         self.error(e.to_string());
                     }
                 }
-                Key::Backspace => {
-                    input.pop();
-                    self.modal = Modal::Prompt { title, input, kind };
+                _ => {
+                    edit_line(&mut input, &mut cursor, &k);
+                    self.modal = Modal::Prompt { title, input, cursor, kind };
                 }
-                Key::Char('u') if ctrl => self.modal = Modal::Prompt { title, input: String::new(), kind },
-                Key::Char(c) if !ctrl => {
-                    input.push(c);
-                    self.modal = Modal::Prompt { title, input, kind };
-                }
-                _ => self.modal = Modal::Prompt { title, input, kind },
             },
+            Modal::Command { mut input, mut cursor } => match k.key {
+                Key::Esc => {}
+                Key::Enter => self.run_command(input.trim()),
+                _ => {
+                    edit_line(&mut input, &mut cursor, &k);
+                    self.modal = Modal::Command { input, cursor };
+                }
+            },
+            Modal::Output { title, lines, mut scroll } => {
+                let max = lines.len().saturating_sub(1);
+                match k.key {
+                    Key::Up | Key::Char('k') => scroll = scroll.saturating_sub(1),
+                    Key::Down | Key::Char('j') => scroll = (scroll + 1).min(max),
+                    Key::PageUp => scroll = scroll.saturating_sub(10),
+                    Key::PageDown => scroll = (scroll + 10).min(max),
+                    _ => return,
+                }
+                self.modal = Modal::Output { title, lines, scroll };
+            }
             Modal::ConfirmDelete { path, message } => match k.key {
-                Key::Char('y') | Key::Char('Y') => {
+                Key::Char('y') | Key::Char('Y') | Key::Enter => {
                     if let Err(e) = self.delete(&path) {
                         self.error(e.to_string());
                     }
                 }
-                Key::Char(_) | Key::Esc | Key::Enter => {}
+                Key::Char(_) | Key::Esc => {}
                 _ => self.modal = Modal::ConfirmDelete { path, message },
             },
             Modal::SaveChanges(after) => match k.key {
@@ -921,6 +1126,45 @@ impl App {
                 }
             }
             Modal::None => {}
+        }
+    }
+
+    // ---- shell ---------------------------------------------------------
+
+    fn run_command(&mut self, cmd: &str) {
+        if cmd.is_empty() {
+            return;
+        }
+        if self.running {
+            return self.error("A command is still running");
+        }
+        // The command sees the files as they are on screen.
+        if self.editor.as_ref().is_some_and(Editor::dirty)
+            && let Err(e) = self.save()
+        {
+            return self.error(e.to_string());
+        }
+        if !self.host.run(cmd, self.tx.clone()) {
+            return self.error("Shell commands need the terminal app");
+        }
+        self.running = true;
+    }
+
+    /// Shows what a command printed: in the status bar if it fits on a line, else in a popup.
+    fn command_done(&mut self, cmd: String, res: Result<String, String>) {
+        let (text, ok) = match res {
+            Ok(t) => (t, true),
+            Err(t) => (t, false),
+        };
+        let lines: Vec<String> = text.lines().map(|l| l.replace('\t', "    ")).collect();
+        match lines.len() {
+            0 => self.info(format!("✓ {cmd}")),
+            1 if ok => self.info(lines[0].clone()),
+            1 => self.error(lines[0].clone()),
+            _ => {
+                let title = if ok { format!("$ {cmd}") } else { format!("$ {cmd} (failed)") };
+                self.modal = Modal::Output { title, lines, scroll: 0 };
+            }
         }
     }
 
@@ -978,7 +1222,11 @@ impl App {
             }
             PromptKind::Rename(old) => {
                 let mut new = clean_rel(input)?;
-                if !self.fs.is_dir(&old) && paths::is_markdown(&old) && !paths::is_markdown(&new) {
+                // Like `mv`: naming an existing folder moves into it.
+                let same = paths::to_slash(&new).to_lowercase() == paths::to_slash(&old).to_lowercase();
+                if self.fs.is_dir(&new) && !same {
+                    new = new.join(old.file_name().unwrap_or_default());
+                } else if !self.fs.is_dir(&old) && paths::is_markdown(&old) && !paths::is_markdown(&new) {
                     new = PathBuf::from(format!("{}.md", new.to_string_lossy()));
                 }
                 self.move_path(&old, &new)
@@ -1118,6 +1366,57 @@ struct Labeled<'a>(usize, &'a str);
 impl AsRef<str> for Labeled<'_> {
     fn as_ref(&self) -> &str {
         self.1
+    }
+}
+
+/// Removes the cursor's line as one undoable edit and returns it with its line break.
+fn cut_line(ta: &mut TextArea) -> String {
+    ta.cancel_selection();
+    let DataCursor(row, _) = ta.cursor();
+    let len = |ta: &TextArea, r: usize| ta.lines()[r].chars().count() as u16;
+    let text = format!("{}\n", ta.lines()[row]);
+    let last = row + 1 == ta.lines().len();
+    // The last line takes the break before it, so no empty line is left behind.
+    let (from, to) = match (last, row) {
+        (true, 0) => ((0, 0), (0, len(ta, 0))),
+        (true, _) => ((row - 1, len(ta, row - 1)), (row, len(ta, row))),
+        (false, _) => ((row, 0), (row + 1, 0)),
+    };
+    ta.move_cursor(CursorMove::Jump(from.0 as u16, from.1));
+    ta.start_selection();
+    ta.move_cursor(CursorMove::Jump(to.0 as u16, to.1));
+    ta.cut();
+    if last && row > 0 {
+        ta.move_cursor(CursorMove::Jump(row as u16 - 1, 0));
+    }
+    text
+}
+
+/// Applies a line-editing key to `input` at `cursor`, a byte offset.
+fn edit_line(input: &mut String, cursor: &mut usize, k: &Input) {
+    let prev = input[..*cursor].char_indices().next_back().map_or(0, |(i, _)| i);
+    let next = input[*cursor..].chars().next().map_or(*cursor, |c| *cursor + c.len_utf8());
+    match k.key {
+        Key::Backspace => {
+            input.replace_range(prev..*cursor, "");
+            *cursor = prev;
+        }
+        Key::Delete => input.replace_range(*cursor..next, ""),
+        Key::Left => *cursor = prev,
+        Key::Right => *cursor = next,
+        Key::Home | Key::Up => *cursor = 0,
+        Key::End | Key::Down => *cursor = input.len(),
+        Key::Char('a') if k.ctrl => *cursor = 0,
+        Key::Char('e') if k.ctrl => *cursor = input.len(),
+        Key::Char('u') if k.ctrl => {
+            input.clear();
+            *cursor = 0;
+        }
+        Key::Char(c) if !k.ctrl => {
+            input.insert(*cursor, c);
+            *cursor += c.len_utf8();
+        }
+        _ => {}
     }
 }
 

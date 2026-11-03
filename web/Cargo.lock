@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "gition"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "nucleo-matcher",
@@ -500,7 +500,9 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "futures-util",
  "getrandom",
+ "gition",
  "serde",
  "serde_json",
  "sha2",

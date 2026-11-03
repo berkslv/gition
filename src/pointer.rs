@@ -4,8 +4,9 @@
 
 use ratatui::layout::{Position, Rect};
 use ratatui_textarea::{CursorMove, Input, Key};
+use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Focus, Modal};
+use crate::app::{App, Editor, Focus, Modal, PageKind, Row};
 use crate::keymap::{Action, KeySpec};
 use crate::markdown::Block;
 
@@ -26,6 +27,14 @@ pub enum Target {
     MenuItem(usize),
 }
 
+/// Text selected by dragging the mouse. The editor's selection lives in its text area;
+/// the viewer's is a range of drawn rows and columns, both ends included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Editor,
+    View { anchor: (usize, usize), head: (usize, usize) },
+}
+
 /// Actions offered by the touch menu, in order, while viewing and while editing.
 const MENU_VIEW: &[Action] = &[
     Action::Edit,
@@ -35,7 +44,6 @@ const MENU_VIEW: &[Action] = &[
     Action::NewFolder,
     Action::Rename,
     Action::Delete,
-    Action::InsertImage,
     Action::OpenExternal,
     Action::ToggleTree,
     Action::ToggleAllFiles,
@@ -54,7 +62,6 @@ pub fn menu_label(a: Action) -> &'static str {
         Action::NewFolder => "New folder",
         Action::Rename => "Rename / move",
         Action::Delete => "Delete",
-        Action::InsertImage => "Insert image",
         Action::OpenExternal => "Open externally",
         Action::ToggleTree => "Show / hide pages",
         Action::ToggleAllFiles => "Show all files",
@@ -76,6 +83,29 @@ pub fn hint_key(segment: &str) -> Option<Input> {
 
 fn key(key: Key) -> Input {
     Input { key, ..Input::default() }
+}
+
+/// Moves the editor's cursor to the text under a cell, clamped to the editor's area.
+fn jump(ta: &mut ratatui_textarea::TextArea, area: Rect, x: u16, y: u16) {
+    let (top, left) = ta.scroll_offset();
+    let x = x.clamp(area.x, area.right().saturating_sub(1));
+    // Past the top or bottom edge reaches one row further, so dragging there scrolls.
+    let row = if y < area.y { top.saturating_sub(1) } else { y.min(area.bottom()) - area.y + top };
+    let c = ta.screen_to_data(row as usize, (x - area.x + left) as usize);
+    ta.move_cursor(CursorMove::Jump(c.0 as u16, c.1 as u16));
+}
+
+/// The characters of `s` drawn in display columns `from..to`.
+fn columns(s: &str, from: usize, to: usize) -> String {
+    let mut col = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        if col >= from && col < to {
+            out.push(ch);
+        }
+        col += ch.width().unwrap_or(0);
+    }
+    out
 }
 
 impl App {
@@ -112,6 +142,7 @@ impl App {
 
     /// A tap or click at a cell.
     pub fn tap(&mut self, x: u16, y: u16) {
+        self.selection = None;
         let target = self.hit(x, y);
         if !matches!(self.modal, Modal::None) {
             return match target {
@@ -160,11 +191,8 @@ impl App {
             Some(Target::Editor(area)) => {
                 self.focus = Focus::Page;
                 if let Some(e) = &mut self.editor {
-                    let (top, left) = e.ta.scroll_offset();
-                    let row = (y - area.y + top) as usize;
-                    let col = (x - area.x + left) as usize;
-                    let c = e.ta.screen_to_data(row, col);
-                    e.ta.move_cursor(CursorMove::Jump(c.0 as u16, c.1 as u16));
+                    e.ta.cancel_selection();
+                    jump(&mut e.ta, area, x, y);
                 }
             }
             Some(Target::Status) => self.open_menu(),
@@ -235,6 +263,132 @@ impl App {
         }
     }
 
+    /// A mouse drag from the cell where the button went down to the one under it now:
+    /// selects text in the editor or the viewer. Call it for every move; `drag_end` copies.
+    pub fn drag(&mut self, from: (u16, u16), to: (u16, u16)) {
+        if !self.modal_is_none() {
+            return;
+        }
+        if !self.dragging {
+            self.selection = None;
+            match self.hit(from.0, from.1) {
+                Some(Target::Editor(area)) => {
+                    self.focus = Focus::Page;
+                    let Some(e) = &mut self.editor else { return };
+                    e.ta.cancel_selection();
+                    jump(&mut e.ta, area, from.0, from.1);
+                    e.ta.start_selection();
+                    self.selection = Some(Selection::Editor);
+                }
+                Some(Target::PageRow(_) | Target::Page) if self.shows_text() => {
+                    self.focus = Focus::Page;
+                    let at = self.view_cell(from.0, from.1);
+                    self.selection = Some(Selection::View { anchor: at, head: at });
+                }
+                _ => return,
+            }
+            self.dragging = true;
+        }
+        match self.selection {
+            Some(Selection::Editor) => {
+                let area = self.hits.iter().find_map(|(_, t)| match t {
+                    Target::Editor(a) => Some(*a),
+                    _ => None,
+                });
+                if let (Some(e), Some(area)) = (&mut self.editor, area) {
+                    jump(&mut e.ta, area, to.0, to.1);
+                }
+            }
+            Some(Selection::View { anchor, .. }) => {
+                let head = self.view_cell(to.0, to.1);
+                // The cursor follows, so the view scrolls when the drag leaves it.
+                self.view.cursor = head.0;
+                self.selection = Some(Selection::View { anchor, head });
+            }
+            None => {}
+        }
+    }
+
+    /// The mouse button went up after a drag: copies what's selected. The selection stays
+    /// visible until the next click or key.
+    pub fn drag_end(&mut self) {
+        self.dragging = false;
+        let text = match self.selection {
+            Some(Selection::Editor) => {
+                self.selection = None;
+                self.editor.as_ref().and_then(Editor::selected_text)
+            }
+            Some(Selection::View { .. }) => Some(self.selected_text()),
+            None => None,
+        };
+        let Some(text) = text.filter(|t| !t.is_empty()) else { return };
+        self.copy(&text);
+    }
+
+    /// Puts `text` on the clipboard and says so.
+    pub(crate) fn copy(&mut self, text: &str) {
+        if self.host.copy(text) {
+            let n = text.chars().count();
+            self.info(format!("Copied {n} character{}", if n == 1 { "" } else { "s" }));
+        } else {
+            self.error("Couldn't copy to the clipboard");
+        }
+    }
+
+    /// The selected columns of a viewer row, end excluded, if any are.
+    pub fn selected_cols(&self, row: usize) -> Option<(usize, usize)> {
+        let Some(Selection::View { anchor, head }) = self.selection else { return None };
+        let (start, end) = if anchor <= head { (anchor, head) } else { (head, anchor) };
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 + 1 } else { usize::MAX };
+        Some((from, to))
+    }
+
+    /// The viewer's selection as text. Rows wrapped from one line join back with a space.
+    fn selected_text(&self) -> String {
+        let mut out = String::new();
+        let mut prev_block = None;
+        for (i, row) in self.view.rows.iter().enumerate() {
+            let Some((from, to)) = self.selected_cols(i) else { continue };
+            let (text, block) = match row {
+                Row::Text { line, block } => (columns(&line.to_string(), from, to), *block),
+                _ => (String::new(), row.block()),
+            };
+            if prev_block.is_some() {
+                if block.is_some() && block == prev_block.flatten() {
+                    out.truncate(out.trim_end().len());
+                    out.push(' ');
+                    out.push_str(text.trim_start());
+                    continue;
+                }
+                out.push('\n');
+            }
+            out.push_str(text.trim_end());
+            prev_block = Some(block);
+        }
+        out
+    }
+
+    /// The viewer is showing rows of text, rather than an image or a notice.
+    fn shows_text(&self) -> bool {
+        let text = matches!(self.page.as_ref().map(|p| &p.kind), Some(PageKind::Markdown(_) | PageKind::Text(_)));
+        text && !self.view.rows.is_empty()
+    }
+
+    /// The viewer row and column under a cell, clamped to the drawn rows.
+    fn view_cell(&self, x: u16, y: u16) -> (usize, usize) {
+        let a = self.view.area;
+        let below = y.saturating_sub(a.y) as usize;
+        let row = (self.view.scroll + below.min(a.height as usize)).min(self.view.rows.len().saturating_sub(1));
+        // Above the rows, the drag reaches up past them one row at a time.
+        let row = if y < a.y { self.view.scroll.saturating_sub(1) } else { row };
+        let col = x.saturating_sub(a.x).min(a.width.saturating_sub(1)) as usize;
+        (row, col)
+    }
+
     /// A horizontal swipe: right shows the tree, left hides it.
     pub fn swipe(&mut self, right: bool) {
         if !self.modal_is_none() || right == self.tree_visible() {
@@ -249,7 +403,7 @@ impl App {
     /// True while there's text to type: the editor, a prompt or the search box.
     pub fn wants_text(&self) -> bool {
         match self.modal {
-            Modal::Prompt { .. } | Modal::Search { .. } => true,
+            Modal::Prompt { .. } | Modal::Command { .. } | Modal::Search { .. } => true,
             Modal::None => self.editor.is_some() && self.focus == Focus::Page,
             _ => false,
         }
@@ -258,7 +412,7 @@ impl App {
     fn row_has_link(&self, i: usize) -> bool {
         let Some(b) = self.view.rows.get(i).and_then(|r| r.block()) else { return false };
         match &self.page.as_ref().map(|p| &p.kind) {
-            Some(crate::app::PageKind::Markdown(blocks)) => match blocks.get(b) {
+            Some(PageKind::Markdown(blocks)) => match blocks.get(b) {
                 Some(Block::Text { links, .. }) => !links.is_empty(),
                 Some(Block::Image { .. }) => true,
                 None => false,

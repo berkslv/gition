@@ -39,8 +39,13 @@ pub struct Ctx {
     pub work: Rc<MemStorage>,
     /// Images chosen in the file picker, waiting for the app.
     pub picked: RefCell<Vec<(String, Vec<u8>)>>,
+    /// Images pasted together, waiting for the app.
+    pub pasted: RefCell<Vec<Pasted>>,
     saved_version: RefCell<u64>,
 }
+
+/// Images from one paste, as (extension, bytes).
+pub type Pasted = Vec<(&'static str, Vec<u8>)>;
 
 /// git's blob id for `data`, to reuse content we already have.
 pub fn git_sha(data: &[u8]) -> String {
@@ -166,6 +171,7 @@ impl Ctx {
             branch,
             base: RefCell::new(base),
             picked: RefCell::new(Vec::new()),
+            pasted: RefCell::new(Vec::new()),
             saved_version: RefCell::new(u64::MAX),
         });
         ctx.save_blob_cache();
@@ -368,6 +374,22 @@ impl Host for WebHost {
     fn pick_image(&self) -> bool {
         let ctx = self.0.clone();
         pick_file(move |name, bytes| ctx.picked.borrow_mut().push((name, bytes))).is_ok()
+    }
+
+    fn fetch_title(&self, url: &str, tx: Sender<Msg>) {
+        let url = url.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            let title = crate::github::page_title(&url).await;
+            let _ = tx.send(Msg::Title(url, title));
+        });
+    }
+
+    fn copy(&self, text: &str) -> bool {
+        // The write finishes later; browsers allow it from the pointer event that ends a drag.
+        web_sys::window().is_some_and(|w| {
+            let _ = w.navigator().clipboard().write_text(text);
+            true
+        })
     }
 }
 

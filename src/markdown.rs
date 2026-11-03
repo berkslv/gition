@@ -1,10 +1,11 @@
 //! Renders markdown into styled terminal lines.
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::Theme;
 use crate::links::md_options;
 
 #[derive(Debug, Clone)]
@@ -27,11 +28,9 @@ impl Block {
     }
 }
 
-const CODE: Style = Style::new().fg(Color::Yellow);
-const DIM: Style = Style::new().fg(Color::DarkGray);
-
 #[derive(Default)]
 struct Renderer {
+    theme: Theme,
     blocks: Vec<Block>,
     spans: Vec<Span<'static>>,
     links: Vec<String>,
@@ -45,8 +44,8 @@ struct Renderer {
     image: Option<(String, String)>,
 }
 
-pub fn render(src: &str) -> Vec<Block> {
-    let mut r = Renderer::default();
+pub fn render(src: &str, theme: &Theme) -> Vec<Block> {
+    let mut r = Renderer { theme: *theme, ..Renderer::default() };
     for ev in Parser::new_ext(src, md_options()) {
         r.event(ev);
     }
@@ -58,6 +57,10 @@ pub fn render(src: &str) -> Vec<Block> {
 }
 
 impl Renderer {
+    fn dim(&self) -> Style {
+        Style::new().fg(self.theme.dim)
+    }
+
     fn style(&self) -> Style {
         self.styles.iter().fold(Style::default(), |acc, s| acc.patch(*s))
     }
@@ -65,10 +68,10 @@ impl Renderer {
     fn prefix(&mut self) -> Vec<Span<'static>> {
         let mut out = Vec::new();
         if self.quote > 0 {
-            out.push(Span::styled("│ ".repeat(self.quote), DIM));
+            out.push(Span::styled("│ ".repeat(self.quote), self.dim()));
         }
         if let Some(b) = self.bullet.take() {
-            out.push(Span::styled(b, Style::new().fg(Color::Cyan)));
+            out.push(Span::styled(b, Style::new().fg(self.theme.bullet)));
         } else if let Some(&w) = self.item_indents.last() {
             out.push(Span::raw(" ".repeat(w)));
         }
@@ -108,34 +111,35 @@ impl Renderer {
                     for l in t.lines().filter(|l| !l.trim().is_empty()) {
                         let (key, value) = l.split_once(':').unwrap_or((l, ""));
                         self.push_line(vec![
-                            Span::styled(format!("{key}: "), DIM),
+                            Span::styled(format!("{key}: "), self.dim()),
                             Span::raw(value.trim().trim_matches('"').to_string()),
                         ]);
                     }
                 } else if self.in_code {
+                    let code = Style::new().fg(self.theme.code);
                     for l in t.split_terminator('\n') {
-                        self.push_line(vec![Span::raw("  "), Span::styled(l.to_string(), CODE)]);
+                        self.push_line(vec![Span::raw("  "), Span::styled(l.to_string(), code)]);
                     }
                 } else {
                     self.spans.push(Span::styled(t.into_string(), self.style()));
                 }
             }
-            Event::Code(t) => self.spans.push(Span::styled(t.into_string(), self.style().patch(CODE))),
+            Event::Code(t) => self.spans.push(Span::styled(t.into_string(), self.style().fg(self.theme.code))),
             Event::Html(t) => {
                 for l in t.split_terminator('\n') {
-                    self.push_line(vec![Span::styled(l.to_string(), DIM)]);
+                    self.push_line(vec![Span::styled(l.to_string(), self.dim())]);
                 }
             }
-            Event::InlineHtml(t) => self.spans.push(Span::styled(t.into_string(), DIM)),
+            Event::InlineHtml(t) => self.spans.push(Span::styled(t.into_string(), self.dim())),
             Event::SoftBreak => self.spans.push(Span::raw(" ")),
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.flush();
-                self.push_line(vec![Span::styled("─".repeat(40), DIM)]);
+                self.push_line(vec![Span::styled("─".repeat(40), self.dim())]);
                 self.blank();
             }
             Event::TaskListMarker(done) => {
-                self.spans.push(Span::styled(if done { "☑ " } else { "☐ " }, Style::new().fg(Color::Cyan)))
+                self.spans.push(Span::styled(if done { "☑ " } else { "☐ " }, Style::new().fg(self.theme.bullet)))
             }
             _ => {}
         }
@@ -147,10 +151,10 @@ impl Renderer {
                 self.flush();
                 let style = match level {
                     HeadingLevel::H1 => {
-                        Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        Style::new().fg(self.theme.heading1).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                     }
-                    HeadingLevel::H2 => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    HeadingLevel::H3 => Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    HeadingLevel::H2 => Style::new().fg(self.theme.heading2).add_modifier(Modifier::BOLD),
+                    HeadingLevel::H3 => Style::new().fg(self.theme.heading3).add_modifier(Modifier::BOLD),
                     _ => Style::new().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
@@ -191,7 +195,7 @@ impl Renderer {
             Tag::Strikethrough => self.styles.push(Style::new().add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
-                self.styles.push(Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
+                self.styles.push(Style::new().fg(self.theme.link).add_modifier(Modifier::UNDERLINED));
             }
             Tag::Image { dest_url, .. } => {
                 self.flush();
@@ -253,9 +257,9 @@ impl Renderer {
             TagEnd::TableHead => {
                 self.styles.pop();
                 self.flush();
-                self.push_line(vec![Span::styled("─".repeat(40), DIM)]);
+                self.push_line(vec![Span::styled("─".repeat(40), self.dim())]);
             }
-            TagEnd::TableCell => self.spans.push(Span::styled(" │ ", DIM)),
+            TagEnd::TableCell => self.spans.push(Span::styled(" │ ", self.dim())),
             TagEnd::TableRow => self.flush(),
             TagEnd::Table => self.blank(),
             _ => {}
@@ -342,14 +346,14 @@ mod tests {
 
     #[test]
     fn renders_front_matter_as_properties() {
-        let blocks = render("---\nStatus: Done\nTitle: \"a: b\"\n---\n\n# A\n");
+        let blocks = render("---\nStatus: Done\nTitle: \"a: b\"\n---\n\n# A\n", &Theme::default());
         assert_eq!(text(&blocks), ["Status: Done", "Title: a: b", "", "A"]);
     }
 
     #[test]
     fn renders_common_blocks() {
         let src = "# Title\n\nHello **world** and [a link](x.md).\n\n- one\n- two\n  1. nested\n\n> quote\n\n![cat](assets/cat.png)\n\n```\ncode\n```\n";
-        let blocks = render(src);
+        let blocks = render(src, &Theme::default());
         assert_eq!(
             text(&blocks),
             [

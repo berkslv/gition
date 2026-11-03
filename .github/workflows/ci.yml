@@ -107,13 +107,13 @@ jobs:
       - uses: actions/checkout@v4
       - if: runner.os != 'Windows'
         run: |
-          GITION_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          GITION_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh
           "$RUNNER_TEMP/bin/gition" --version
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $env:GITION_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
-          ./install.ps1
+          ./scripts/install.ps1
           & "$env:RUNNER_TEMP\bin\gition.exe" --version
 
   build:

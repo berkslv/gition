@@ -1,6 +1,6 @@
 [package]
 name = "gition"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Notion-style notebook for the terminal, stored as markdown in git"
 license = "MIT"
@@ -14,8 +14,8 @@ categories = ["command-line-utilities"]
 
 [features]
 default = ["native"]
-# Terminal frontend and git CLI backend. The web build turns this off.
-native = ["dep:crossterm", "dep:image", "dep:open", "dep:ratatui-image", "ratatui/crossterm", "ratatui-textarea/crossterm"]
+# Terminal frontend, git CLI backend and page titles over HTTP. The web build turns this off.
+native = ["dep:crossterm", "dep:image", "dep:open", "dep:ratatui-image", "dep:ureq", "ratatui/crossterm", "ratatui-textarea/crossterm"]
 
 [[bin]]
 name = "gition"
@@ -34,6 +34,7 @@ ratatui-textarea = { version = "0.9.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 unicode-width = "0.2"
+ureq = { version = "3.5.1", optional = true }
 web-time = "1.1"
 
 [dev-dependencies]

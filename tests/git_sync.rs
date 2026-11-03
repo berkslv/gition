@@ -49,6 +49,8 @@ fn init_creates_files_and_commit() {
     assert!(repo::has_index(dir));
     assert!(dir.join("assets/.gitkeep").exists());
     assert!(dir.join(".gitattributes").exists());
+    assert!(dir.join("AGENTS.md").exists());
+    gition::config::Config::load(dir).unwrap();
     assert_eq!(sh(dir, &["log", "--format=%s"]).trim(), "gition: init");
     assert_eq!(git::state(dir).remote, Remote::None);
     assert_eq!(git::state(dir).changes, 0);

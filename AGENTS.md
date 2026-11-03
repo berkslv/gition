@@ -28,14 +28,17 @@ On the tag, `.github/workflows/ci.yml` checks that the tag matches the version, 
 - `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy.
 - `host.rs`: the `Host` trait (fetch, sync, open externally, file picker). `GitHost` is the git CLI. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
 - `ui.rs`: drawing only. Must not mutate files.
-- `pointer.rs`: touch and mouse. `ui.rs` records what it drew where (`App::hits`); taps, long presses, scrolls and swipes run the same actions as keys. The touch menu lists actions; it has no key of its own.
+- `pointer.rs`: touch and mouse. `ui.rs` records what it drew where (`App::hits`); taps, long presses, scrolls and swipes run the same actions as keys. A mouse drag selects text and copies it on release through `Host::copy`. The touch menu lists actions; it has no key of its own.
 - `markdown.rs`: pulldown-cmark to styled `Block`s, plus `wrap`.
 - `links.rs`: finding and rewriting inline links. Used by rename/move and the delete warning.
+- `paste.rs`: what a paste turns into: bare URL detection, page titles from HTML, image paths from a terminal paste, names for clipboard images. Pure, so the worker uses it too. The app swaps a pasted URL for its link when `Host::fetch_title` answers with `Msg::Title`.
 - `import.rs`: `gition [PATH] import notion EXPORT_DIR`. Turns a Notion "Markdown & CSV" export into pages, through `Storage`.
 - `git.rs`: shells out to the `git` CLI. Don't use `git2`/`gix`.
+- `update.rs`: the startup check for a newer GitHub release. `main.rs` shows it while gition runs and prints the update command on quit.
+- `scripts/`: install and update scripts, `.sh` for macOS/Linux and `.ps1` for Windows. `update.rs` prints the update script's URL, so keep the two in step.
 - `tree.rs`, `paths.rs`, `repo.rs`, `config.rs`, `keymap.rs`, `images.rs`.
 - `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones.
-- `web/server`: the Worker. It only handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie.
+- `web/server`: the Worker. It handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie. `/auth/title` reads a page's title for signed-in users, since the browser can't across origins.
 
 ## Rules
 

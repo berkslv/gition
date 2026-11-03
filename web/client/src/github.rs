@@ -71,6 +71,14 @@ pub async fn session() -> Result<Option<Session>> {
     }
 }
 
+/// Asks the worker for the title of the page at `url`.
+pub async fn page_title(url: &str) -> Option<String> {
+    let url = format!("/auth/title?url={}", String::from(js_sys::encode_uri_component(url)));
+    let (status, body) = http("GET", &url, &[], None).await.ok()?;
+    let v: Value = serde_json::from_str(&body).ok().filter(|_| status == 200)?;
+    v["title"].as_str().map(str::to_string)
+}
+
 fn now_secs() -> f64 {
     js_sys::Date::now() / 1000.0
 }

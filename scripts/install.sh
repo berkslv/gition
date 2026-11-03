@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs gition from GitHub Releases.
-#   curl -fsSL https://raw.githubusercontent.com/berkslv/gition/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/berkslv/gition/main/scripts/install.sh | sh
 # Env: GITION_VERSION (e.g. v0.1.0, default latest), GITION_INSTALL_DIR (default ~/.local/bin)
 set -eu
 
@@ -18,7 +18,7 @@ need uname
 case "$(uname -s)" in
   Linux) os="unknown-linux-gnu" ;;
   Darwin) os="apple-darwin" ;;
-  MINGW* | MSYS* | CYGWIN*) die "on Windows use: powershell -c \"irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex\"" ;;
+  MINGW* | MSYS* | CYGWIN*) die "on Windows use: powershell -c \"irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex\"" ;;
   *) die "unsupported OS: $(uname -s)" ;;
 esac
 case "$(uname -m)" in

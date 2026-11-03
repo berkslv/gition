@@ -27,6 +27,7 @@ actions! {
     Quit => "quit", "quit", ["q", "ctrl+c"];
     Help => "help", "show this help", ["?"];
     Search => "search", "fuzzy-find a page", ["/"];
+    Shell => "shell", "run a shell command in the repo", ["!"];
     Sync => "sync", "save, commit everything, pull --rebase, push", ["ctrl+g"];
     ToggleTree => "toggle_tree", "show/hide the tree", ["ctrl+b"];
     SwitchFocus => "switch_focus", "switch focus tree <-> page", ["tab"];
@@ -49,8 +50,12 @@ actions! {
     OpenExternal => "open_external", "open with system app", ["o"];
     // edit
     Save => "save", "save", ["ctrl+s"];
+    SelectAll => "select_all", "select everything", ["ctrl+a"];
+    Copy => "copy", "copy the selection (quits without one)", ["ctrl+c"];
+    Cut => "cut", "cut the line, or the selection", ["ctrl+x"];
     Undo => "undo", "undo", ["ctrl+z"];
     Redo => "redo", "redo", ["ctrl+y"];
+    PasteImage => "paste_image", "paste the image on the clipboard", ["ctrl+v"];
     ExitEdit => "exit_edit", "back to view", ["esc"];
 }
 

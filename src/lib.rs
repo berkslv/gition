@@ -8,6 +8,7 @@ pub mod import;
 pub mod keymap;
 pub mod links;
 pub mod markdown;
+pub mod paste;
 pub mod paths;
 pub mod pointer;
 pub mod repo;
@@ -15,3 +16,5 @@ pub mod storage;
 pub mod sync;
 pub mod tree;
 pub mod ui;
+#[cfg(feature = "native")]
+pub mod update;

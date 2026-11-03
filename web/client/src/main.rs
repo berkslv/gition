@@ -267,8 +267,10 @@ fn handle(screen: &Shared, input: Input) -> bool {
             Screen::App(app, _) => {
                 // Leave browser shortcuts (copy, paste, reload, …) alone unless gition binds them.
                 let bound = Action::ALL.iter().any(|&a| app.keys.is(a, &input));
-                let clipboard = input.ctrl && matches!(input.key, Key::Char('c' | 'v' | 'x'));
-                let take = !clipboard && (plain || bound || app.editor.is_some() && input.ctrl);
+                // Copy goes to gition when its editor has a selection.
+                let selected = app.editor.as_ref().is_some_and(|e| e.selected_text().is_some());
+                let clipboard = input.ctrl && (input.key == Key::Char('v') || input.key == Key::Char('c') && !selected);
+                let take = !clipboard && (plain || bound || app.editor.is_some() && (input.ctrl || input.alt));
                 if take {
                     app.on_key(input.clone());
                 }
@@ -378,9 +380,27 @@ fn listen(screen: &Shared) {
     let keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| on_key(&s, &e));
     let s = screen.clone();
     let paste = Closure::<dyn FnMut(ClipboardEvent)>::new(move |e: ClipboardEvent| {
-        if let Screen::App(app, _) = &mut *s.borrow_mut()
-            && let Some(text) = e.clipboard_data().and_then(|d| d.get_data("text").ok())
-        {
+        let Screen::App(app, ctx) = &mut *s.borrow_mut() else { return };
+        let Some(data) = e.clipboard_data() else { return };
+        // Images win over the text that often comes with them.
+        let files = data.files();
+        let images: Vec<_> = (0..files.as_ref().map_or(0, |f| f.length()))
+            .filter_map(|i| files.as_ref()?.get(i))
+            .filter_map(|f| Some((gition::paste::image_ext(&f.type_())?, f)))
+            .collect();
+        if !images.is_empty() {
+            e.prevent_default();
+            let ctx = ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut batch = Vec::new();
+                for (ext, file) in images {
+                    if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                        batch.push((ext, js_sys::Uint8Array::new(&buf).to_vec()));
+                    }
+                }
+                ctx.pasted.borrow_mut().push(batch);
+            });
+        } else if let Ok(text) = data.get_data("text") {
             app.on_paste(text);
             e.prevent_default();
         }
@@ -523,6 +543,10 @@ fn listen_touch(screen: &Shared) {
         // Keeps the focus (and so the keyboard) where it is; taps are handled on release.
         e.prevent_default();
         let touch = e.pointer_type() != "mouse";
+        // A mouse drag that leaves the grid still selects up to its edge, and its release still arrives.
+        if !touch && let Some(t) = e.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let _ = t.set_pointer_capture(e.pointer_id());
+        }
         let (x, y) = (e.client_x() as f64, e.client_y() as f64);
         let mut press = Press { id: e.pointer_id(), touch, x, y, scrolled_y: y, ..Press::default() };
         if touch {
@@ -559,6 +583,16 @@ fn listen_touch(screen: &Shared) {
                 window().clear_timeout_with_handle(t);
             }
         }
+        // A mouse drag selects text.
+        if !p.touch {
+            if !p.moved {
+                return;
+            }
+            let (Some((c0, r0, _)), Some((c1, r1, _))) = (cell_at(p.x, p.y), cell_at(x, y)) else { return };
+            drop(gs);
+            with_app(&s, |app| app.drag((c0, r0), (c1, r1)));
+            return;
+        }
         // A vertical drag scrolls what's under the finger, a row at a time.
         if !p.touch || !p.moved || p.held || (x - p.x).abs() > (y - p.y).abs() {
             return;
@@ -587,7 +621,9 @@ fn listen_touch(screen: &Shared) {
         let (dx, dy) = (x - p.x, y - p.y);
         if p.moved {
             drop(gs);
-            if p.touch && dx.abs() > SWIPE_MIN && dx.abs() > 2.0 * dy.abs() {
+            if !p.touch {
+                with_app(&s, |app| app.drag_end());
+            } else if dx.abs() > SWIPE_MIN && dx.abs() > 2.0 * dy.abs() {
                 with_app(&s, |app| app.swipe(dx > 0.0));
             }
             return fit_keyboard(&s);
@@ -809,6 +845,10 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
             let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
             for (name, bytes) in picked {
                 app.insert_image_data(&name, &bytes);
+            }
+            let pasted: Vec<_> = ctx.pasted.borrow_mut().drain(..).collect();
+            for images in pasted {
+                app.paste_images(images);
             }
             app.tick();
             if app.quit {

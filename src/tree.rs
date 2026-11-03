@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::paths;
-use crate::repo::INDEX;
+use crate::repo::{AGENTS, INDEX};
 use crate::storage::Storage;
 
 #[derive(Debug, Clone)]
@@ -41,9 +41,13 @@ impl Filter<'_> {
         if name.starts_with('.') || name == INDEX {
             return false;
         }
+        let top = rel.parent() == Some(Path::new(""));
         if is_dir {
             // Only the top-level assets dir is hidden.
-            return !(rel.parent() == Some(Path::new("")) && name == self.assets_dir);
+            return !(top && name == self.assets_dir);
+        }
+        if top && name == AGENTS {
+            return false;
         }
         paths::is_markdown(rel)
     }
@@ -134,6 +138,8 @@ mod tests {
             "Projects/INDEX.md",
             "Projects/plan.md",
             ".hidden/x.md",
+            "AGENTS.md",
+            "Projects/AGENTS.md",
         ] {
             let p = root.join(f);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -144,12 +150,15 @@ mod tests {
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("Projects"));
         let names: Vec<_> = flatten(&tree, &expanded).into_iter().skip(1).map(|v| (v.name, v.depth)).collect();
-        assert_eq!(names, [("Projects".into(), 1), ("plan".into(), 2), ("A".into(), 1), ("b".into(), 1)]);
+        assert_eq!(
+            names,
+            [("Projects".into(), 1), ("AGENTS".into(), 2), ("plan".into(), 2), ("A".into(), 1), ("b".into(), 1)]
+        );
 
         let all = build(&store, &Filter { show_all: true, assets_dir: "assets" });
         let names: Vec<_> = all.children.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names, [".hidden", "assets", "Projects", "A.md", "b.md", "INDEX.md", "notes.txt"]);
+        assert_eq!(names, [".hidden", "assets", "Projects", "A.md", "AGENTS.md", "b.md", "INDEX.md", "notes.txt"]);
 
-        assert_eq!(markdown_files(&store).len(), 5);
+        assert_eq!(markdown_files(&store).len(), 7);
     }
 }

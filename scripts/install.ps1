@@ -1,5 +1,5 @@
 # Installs gition from GitHub Releases.
-#   powershell -c "irm https://raw.githubusercontent.com/berkslv/gition/main/install.ps1 | iex"
+#   powershell -c "irm https://raw.githubusercontent.com/berkslv/gition/main/scripts/install.ps1 | iex"
 # Env: GITION_VERSION (e.g. v0.1.0, default latest),
 #      GITION_INSTALL_DIR (default %LOCALAPPDATA%\Programs\gition),
 #      GITION_NO_MODIFY_PATH=1 to leave the user PATH alone.

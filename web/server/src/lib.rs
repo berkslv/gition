@@ -1,4 +1,5 @@
-//! The only server-side part of gition web: GitHub sign-in.
+//! The only server-side part of gition web: GitHub sign-in, plus reading page
+//! titles for pasted links, which the browser can't do itself across origins.
 //!
 //! Static files are served by Workers Static Assets; requests that don't match a
 //! file land here. The worker keeps no state. The user's tokens live in an
@@ -37,6 +38,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/auth/login" => login(&url, &env),
         "/auth/callback" => callback(&req, &url, &env).await,
         "/auth/token" => token(&req, &env).await,
+        "/auth/title" => title(&req, &url, &env).await,
         "/auth/logout" => redirect("/", &[cookie(SESSION, "", 0)]),
         _ => Response::error("Not found", 404),
     };
@@ -131,6 +133,61 @@ async fn token(req: &Request, env: &Env) -> Result<Response> {
         res.headers_mut().append("Set-Cookie", &c)?;
     }
     Ok(res)
+}
+
+/// `{"title": …}` for the page at `?url=`, or `{}` if it has none or can't be read.
+/// Only for signed-in users, so it isn't an open proxy.
+async fn title(req: &Request, url: &Url, env: &Env) -> Result<Response> {
+    if get_cookie(req, SESSION).and_then(|c| open(env, &c).ok()).is_none() {
+        return Response::error("Not signed in", 401);
+    }
+    let target = url.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned());
+    let page = async { page_title(Url::parse(&target?).ok()?).await };
+    let timeout = Delay::from(std::time::Duration::from_secs(5));
+    let title = match futures_util::future::select(Box::pin(page), timeout).await {
+        futures_util::future::Either::Left((title, _)) => title,
+        futures_util::future::Either::Right(_) => None,
+    };
+    let mut res = Response::from_json(&title.map_or(json!({}), |t| json!({ "title": t })))?;
+    res.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(res)
+}
+
+/// Fetches an http(s) page, following up to 5 redirects, and reads the title
+/// from its first 512 KB.
+async fn page_title(mut url: Url) -> Option<String> {
+    use futures_util::StreamExt;
+
+    for _ in 0..=5 {
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        let headers = Headers::new();
+        headers.set("User-Agent", concat!("gition/", env!("CARGO_PKG_VERSION"))).ok()?;
+        headers.set("Accept", "text/html").ok()?;
+        let mut init = RequestInit::new();
+        init.with_headers(headers).with_redirect(RequestRedirect::Manual);
+        let req = Request::new_with_init(url.as_str(), &init).ok()?;
+        let mut res = Fetch::Request(req).send().await.ok()?;
+        if (300..400).contains(&res.status_code()) {
+            url = url.join(&res.headers().get("Location").ok()??).ok()?;
+            continue;
+        }
+        let html = res.headers().get("Content-Type").ok()??.to_ascii_lowercase().contains("text/html");
+        if !(200..300).contains(&res.status_code()) || !html {
+            return None;
+        }
+        let mut body = Vec::new();
+        let mut stream = res.stream().ok()?;
+        while body.len() < 512 * 1024
+            && let Some(chunk) = stream.next().await
+        {
+            body.extend(chunk.ok()?);
+        }
+        body.truncate(512 * 1024);
+        return gition::paste::page_title(&String::from_utf8_lossy(&body));
+    }
+    None
 }
 
 /// Calls GitHub's token endpoint with the app credentials plus `params`.

@@ -2,22 +2,19 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame_, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Modal, PageKind, Row};
+use crate::config::Theme;
 use crate::keymap::Action;
 use crate::links;
 use crate::markdown::Block;
 use crate::paths;
 use crate::pointer::{self, Target};
 use crate::sync::Remote;
-
-const ACCENT: Color = Color::Cyan;
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const CURSOR_BG: Color = Color::Indexed(236);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -36,15 +33,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.extend(hits);
 }
 
-fn pane(title: String, focused: bool) -> Frame_<'static> {
+fn pane(th: &Theme, title: String, focused: bool) -> Frame_<'static> {
     Frame_::bordered().title(Span::styled(title, Style::new().add_modifier(Modifier::BOLD))).border_style(if focused {
-        Style::new().fg(ACCENT)
+        Style::new().fg(th.accent)
     } else {
-        DIM
+        Style::new().fg(th.dim)
     })
 }
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.cfg.theme;
     let focused = app.focus == Focus::Tree;
     let current = app.page.as_ref().map(|p| p.path.clone());
     let items: Vec<ListItem> = app
@@ -55,20 +53,20 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
             let is_current = current
                 .as_ref()
                 .is_some_and(|c| *c == v.path || (v.is_dir && paths::is_index(c) && paths::parent(c) == v.path));
-            let mut style = if v.is_dir { Style::new().fg(Color::Blue) } else { Style::new() };
+            let mut style = if v.is_dir { Style::new().fg(th.folder) } else { Style::new() };
             if is_current {
-                style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
+                style = style.fg(th.current).add_modifier(Modifier::BOLD);
             }
             let indent = "  ".repeat(v.depth.saturating_sub(1));
             ListItem::new(Line::from(vec![
                 Span::raw(indent),
-                Span::styled(icon, DIM),
+                Span::styled(icon, Style::new().fg(th.dim)),
                 Span::styled(v.name.clone(), style),
             ]))
         })
         .collect();
-    let highlight = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new().bg(CURSOR_BG) };
-    let block = pane(" Pages ".into(), focused);
+    let highlight = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new().bg(th.cursor) };
+    let block = pane(&th, " Pages ".into(), focused);
     let inner = block.inner(area);
     let list = List::new(items).block(block).highlight_style(highlight);
     app.tree_state.select(Some(app.sel));
@@ -80,6 +78,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.cfg.theme;
     let focused = app.focus == Focus::Page;
     let (title, editing) = match (&app.editor, &app.page) {
         (Some(e), _) => {
@@ -89,7 +88,7 @@ fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
         (None, Some(p)) => (format!(" {} ", paths::to_slash(&p.path)), false),
         (None, None) => (" gition ".into(), false),
     };
-    let block = pane(title, focused);
+    let block = pane(&th, title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hits.push((area, Target::Page));
@@ -102,7 +101,7 @@ fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let notice = |f: &mut Frame, text: String| {
-        f.render_widget(Paragraph::new(text).style(DIM).wrap(Wrap { trim: false }), inner);
+        f.render_widget(Paragraph::new(text).style(Style::new().fg(th.dim)).wrap(Wrap { trim: false }), inner);
     };
     let Some(page) = &app.page else {
         return notice(
@@ -152,7 +151,9 @@ fn draw_image(_f: &mut Frame, _app: &mut App, _path: &std::path::Path, _area: Re
 }
 
 fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
+    let th = app.cfg.theme;
     app.layout(inner.width, inner.height);
+    app.view.area = inner;
     #[cfg_attr(not(feature = "native"), allow(unused_variables))]
     let App { view, images, page, hits, .. } = app;
     let Some(page) = page else { return };
@@ -165,7 +166,7 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
         let rect = Rect::new(inner.x, y, inner.width, 1);
         hits.push((rect, Target::PageRow(i)));
         let is_cursor = focused && i == view.cursor;
-        let highlight = if is_cursor { Style::new().bg(CURSOR_BG) } else { Style::new() };
+        let highlight = if is_cursor { Style::new().bg(th.cursor) } else { Style::new() };
         let placeholder = |block: usize| {
             let (dest, alt) = match blocks.get(block) {
                 Some(Block::Image { dest, alt }) => (dest.as_str(), alt.as_str()),
@@ -174,7 +175,7 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
             let label = if alt.is_empty() { dest } else { alt };
             Paragraph::new(Line::from(vec![
                 Span::raw("🖼 "),
-                Span::styled(label.to_string(), Style::new().fg(Color::Magenta)),
+                Span::styled(label.to_string(), Style::new().fg(th.image)),
             ]))
             .style(highlight)
         };
@@ -203,24 +204,41 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
             }
         }
     }
+    draw_selection(f, app, inner);
+}
+
+/// Marks the viewer's selected cells.
+fn draw_selection(f: &mut Frame, app: &App, inner: Rect) {
+    let th = app.cfg.theme;
+    let end = (app.view.scroll + inner.height as usize).min(app.view.rows.len());
+    for (i, y) in (app.view.scroll..end).zip(inner.y..) {
+        let Some((from, to)) = app.selected_cols(i) else { continue };
+        let x0 = inner.x.saturating_add(from.min(inner.width as usize) as u16);
+        let x1 = inner.x.saturating_add(to.min(inner.width as usize) as u16);
+        f.buffer_mut().set_style(Rect::new(x0, y, x1 - x0, 1), th.selected());
+    }
 }
 
 fn status_text(app: &App) -> (String, Style) {
+    let th = app.cfg.theme;
     if app.busy {
-        return ("syncing…".into(), Style::new().fg(Color::Yellow));
+        return ("syncing…".into(), Style::new().fg(th.warning));
+    }
+    if app.running {
+        return ("running…".into(), Style::new().fg(th.warning));
     }
     let Some(st) = &app.git else { return (String::new(), Style::new()) };
     let (text, color) = match &st.remote {
-        Remote::None => ("no remote".to_string(), Color::DarkGray),
-        Remote::NoUpstream => ("not pushed yet".to_string(), Color::Yellow),
-        Remote::Offline(_) => ("offline".to_string(), Color::Red),
-        Remote::Tracking { ahead: 0, behind: 0 } => ("✓ up to date".to_string(), Color::Green),
-        Remote::Tracking { ahead, behind: 0 } => (format!("↑{ahead} ahead"), Color::Yellow),
+        Remote::None => ("no remote".to_string(), th.dim),
+        Remote::NoUpstream => ("not pushed yet".to_string(), th.warning),
+        Remote::Offline(_) => ("offline".to_string(), th.error),
+        Remote::Tracking { ahead: 0, behind: 0 } => ("✓ up to date".to_string(), th.ok),
+        Remote::Tracking { ahead, behind: 0 } => (format!("↑{ahead} ahead"), th.warning),
         Remote::Tracking { ahead: 0, behind } => {
-            (format!("↓{behind} behind, {} to sync", app.keys.label(Action::Sync)), Color::Yellow)
+            (format!("↓{behind} behind, {} to sync", app.keys.label(Action::Sync)), th.warning)
         }
         Remote::Tracking { ahead, behind } => {
-            (format!("↑{ahead} ↓{behind} diverged, {} to sync", app.keys.label(Action::Sync)), Color::Red)
+            (format!("↑{ahead} ↓{behind} diverged, {} to sync", app.keys.label(Action::Sync)), th.error)
         }
     };
     let text = if st.changes > 0 { format!("● {} changed · {text}", st.changes) } else { text };
@@ -228,19 +246,41 @@ fn status_text(app: &App) -> (String, Style) {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.cfg.theme;
     // On touch screens the status bar opens the menu, so it always says so.
     let menu = if app.touch { " ☰" } else { "" };
+    if let Modal::Command { input, cursor } = &app.modal {
+        let line = Line::from(input_spans(&th, " ! ", input, *cursor, (area.width as usize).saturating_sub(5)));
+        return f.render_widget(Paragraph::new(line).style(Style::new().bg(th.bar)), area);
+    }
     let left = match &app.message {
-        Some((m, true, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(Color::Red)),
-        Some((m, false, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(Color::Green)),
-        None if app.touch => Span::styled(" ☰ Menu", DIM),
-        None => Span::styled(format!(" {} for help", app.keys.label(Action::Help)), DIM),
+        Some((m, true, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(th.error)),
+        Some((m, false, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(th.ok)),
+        None if app.touch => Span::styled(" ☰ Menu", Style::new().fg(th.dim)),
+        None => Span::styled(format!(" {} for help", app.keys.label(Action::Help)), Style::new().fg(th.dim)),
     };
     let (right, style) = status_text(app);
     let right = format!("{right} ");
     let pad = (area.width as usize).saturating_sub(left.content.width() + right.width());
     let line = Line::from(vec![left, Span::raw(" ".repeat(pad)), Span::styled(right, style)]);
-    f.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Indexed(235))), area);
+    f.render_widget(Paragraph::new(line).style(Style::new().bg(th.bar)), area);
+}
+
+/// A one-line input with its cursor, after `prefix`. Leading chars that don't fit in
+/// `room` before the cursor are dropped, so the cursor stays in view.
+fn input_spans(th: &Theme, prefix: &str, input: &str, cursor: usize, room: usize) -> Vec<Span<'static>> {
+    let before: Vec<char> = input[..cursor].chars().collect();
+    let before: String = before[before.len().saturating_sub(room)..].iter().collect();
+    let mut after = input[cursor..].chars();
+    let mut spans = vec![Span::styled(prefix.to_string(), Style::new().fg(th.accent)), Span::raw(before)];
+    match after.next() {
+        Some(c) => {
+            spans.push(Span::styled(c.to_string(), Style::new().add_modifier(Modifier::REVERSED)));
+            spans.push(Span::raw(after.collect::<String>()));
+        }
+        None => spans.push(Span::styled("█", Style::new().fg(th.accent))),
+    }
+    spans
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -251,33 +291,28 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// Draws the open modal; returns what it drew where.
 fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
-    let hint = |s: &str| Line::styled(s.to_string(), DIM);
+    let th = app.cfg.theme;
+    let hint = |s: &str| Line::styled(s.to_string(), Style::new().fg(th.dim));
     let mut hits = Vec::new();
     match &app.modal {
         Modal::None => {}
-        Modal::Prompt { title, input, .. } => {
+        Modal::Prompt { title, input, cursor, .. } => {
             let r = centered(area, 64, 5);
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("> ", Style::new().fg(ACCENT)),
-                    Span::raw(input.clone()),
-                    Span::styled("█", Style::new().fg(ACCENT)),
-                ]),
-                Line::raw(""),
-                hint("Enter confirm · Esc cancel"),
-            ];
+            let input = input_spans(&th, "> ", input, *cursor, (r.width as usize).saturating_sub(5));
+            let lines = vec![Line::from(input), Line::raw(""), hint("Enter confirm · Esc cancel")];
             hint_hits(&mut hits, r, 2, "Enter confirm · Esc cancel");
-            popup(f, &mut hits, r, title, lines);
+            popup(f, &th, &mut hits, r, title, lines);
         }
         Modal::ConfirmDelete { message, .. } => {
             let r = centered(area, 64, 5);
-            hint_hits(&mut hits, r, 2, "y delete · any other key cancel");
+            hint_hits(&mut hits, r, 2, "y or Enter delete · any other key cancel");
             popup(
                 f,
+                &th,
                 &mut hits,
                 r,
                 "Delete",
-                vec![Line::raw(message.clone()), Line::raw(""), hint("y delete · any other key cancel")],
+                vec![Line::raw(message.clone()), Line::raw(""), hint("y or Enter delete · any other key cancel")],
             );
         }
         Modal::SaveChanges(_) => {
@@ -285,6 +320,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
             hint_hits(&mut hits, r, 2, "y save · n discard · Esc cancel");
             popup(
                 f,
+                &th,
                 &mut hits,
                 r,
                 "Unsaved changes",
@@ -296,9 +332,9 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
             let max = r.height.saturating_sub(4) as usize;
             let start = sel.saturating_sub(max.saturating_sub(1));
             let mut lines = vec![Line::from(vec![
-                Span::styled("/ ", Style::new().fg(ACCENT)),
+                Span::styled("/ ", Style::new().fg(th.accent)),
                 Span::raw(query.clone()),
-                Span::styled("█", Style::new().fg(ACCENT)),
+                Span::styled("█", Style::new().fg(th.accent)),
             ])];
             lines.push(hint(&format!("{} of {}", results.len(), items.len())));
             for (n, &i) in results.iter().enumerate().skip(start).take(max) {
@@ -307,7 +343,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
                 hits.push((Rect::new(r.x + 1, y, r.width.saturating_sub(2), 1), Target::SearchResult(n)));
                 lines.push(Line::styled(format!(" {} ", items[i].0), style));
             }
-            popup(f, &mut hits, r, "Find page", lines);
+            popup(f, &th, &mut hits, r, "Find page", lines);
         }
         Modal::Help => {
             let sections: [(&str, &[Action]); 4] = [
@@ -315,6 +351,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
                     "Global",
                     &[
                         Action::Search,
+                        Action::Shell,
                         Action::Sync,
                         Action::ToggleTree,
                         Action::SwitchFocus,
@@ -338,11 +375,11 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
                     ],
                 ),
                 ("Page", &[Action::Edit, Action::Follow, Action::OpenExternal, Action::PageUp, Action::PageDown]),
-                ("Editor", &[Action::Save, Action::Undo, Action::Redo, Action::ExitEdit]),
+                ("Editor", &[Action::Save, Action::SelectAll, Action::Undo, Action::Redo, Action::ExitEdit]),
             ];
             let mut lines = Vec::new();
             for (name, actions) in sections {
-                lines.push(Line::styled(name, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)));
+                lines.push(Line::styled(name, Style::new().fg(th.accent).add_modifier(Modifier::BOLD)));
                 for &a in actions {
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {:<18}", app.keys.label(a)), Style::new().add_modifier(Modifier::BOLD)),
@@ -352,7 +389,19 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
             }
             lines.push(hint("Keys are configurable in .gition.toml · any key closes"));
             let r = centered(area, 66, lines.len() as u16 + 2);
-            popup(f, &mut hits, r, "Keys", lines);
+            popup(f, &th, &mut hits, r, "Keys", lines);
+        }
+        Modal::Command { .. } => {}
+        Modal::Output { title, lines, scroll } => {
+            let r = centered(area, 100, lines.len() as u16 + 4);
+            let max = r.height.saturating_sub(4) as usize;
+            let mut shown: Vec<Line> = lines.iter().skip(*scroll).take(max).map(|l| Line::raw(l.clone())).collect();
+            shown.resize(max, Line::raw(""));
+            shown.push(Line::raw(""));
+            let more = if lines.len() > max { "↑↓ scroll · " } else { "" };
+            shown.push(hint(&format!("{more}any key closes")));
+            hint_hits(&mut hits, r, max as u16 + 1, &format!("{more}any key closes"));
+            popup(f, &th, &mut hits, r, title, shown);
         }
         Modal::Menu { items, sel } => {
             let r = centered(area, 40, items.len() as u16 + 2);
@@ -366,14 +415,14 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
                 lines.push(
                     Line::from(vec![
                         Span::raw(format!(" {label}{} ", " ".repeat(pad))),
-                        Span::styled(key, DIM),
+                        Span::styled(key, Style::new().fg(th.dim)),
                         Span::raw(" "),
                     ])
                     .style(style),
                 );
                 hits.push((Rect::new(r.x + 1, r.y + 1 + n as u16, inner as u16, 1), Target::MenuItem(n)));
             }
-            popup(f, &mut hits, r, "Menu", lines);
+            popup(f, &th, &mut hits, r, "Menu", lines);
         }
     }
     hits
@@ -391,10 +440,10 @@ fn hint_hits(hits: &mut Vec<(Rect, Target)>, popup: Rect, line: u16, text: &str)
     }
 }
 
-fn popup(f: &mut Frame, hits: &mut Vec<(Rect, Target)>, r: Rect, title: &str, lines: Vec<Line>) {
+fn popup(f: &mut Frame, th: &Theme, hits: &mut Vec<(Rect, Target)>, r: Rect, title: &str, lines: Vec<Line>) {
     // Under the finer targets: taps on the rest of the modal don't reach the panes.
     hits.insert(0, (r, Target::Modal));
     f.render_widget(Clear, r);
-    let block = Frame_::bordered().title(format!(" {title} ")).border_style(Style::new().fg(ACCENT));
+    let block = Frame_::bordered().title(format!(" {title} ")).border_style(Style::new().fg(th.accent));
     f.render_widget(Paragraph::new(lines).block(block), r);
 }
