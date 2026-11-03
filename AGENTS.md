@@ -13,11 +13,11 @@ gition is a Rust TUI notebook: a markdown page tree, a viewer and an editor, wit
 ## Releasing
 
 Bump `version` in `Cargo.toml`, commit, then `git tag -a vX.Y.Z -m vX.Y.Z && git push origin main vX.Y.Z`.
-`.github/workflows/release.yml` checks that the tag matches the version, runs the tests, builds the binaries, creates the GitHub Release and publishes to crates.io through Trusted Publishing. Never run `cargo publish` by hand.
+On the tag, `.github/workflows/ci.yml` checks that the tag matches the version, runs the tests, builds the binaries, creates the GitHub Release and publishes to crates.io through Trusted Publishing. Never run `cargo publish` by hand.
 
 ## Web deploy
 
-`.github/workflows/web.yml` deploys `web/` with `wrangler deploy` on every push to main, once the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set. The Worker needs the vars `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG` in `web/wrangler.toml`, plus the secrets `GITHUB_CLIENT_SECRET` and `SESSION_KEY` (`npx wrangler secret put NAME`).
+`.github/workflows/ci.yml` deploys `web/` with `wrangler deploy` on every push to main, after the tests and the web build pass. It uses the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. The Worker needs the vars `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG` in `web/wrangler.toml`, plus the secrets `GITHUB_CLIENT_SECRET` and `SESSION_KEY` (`npx wrangler secret put NAME`).
 
 ## Layout
 
