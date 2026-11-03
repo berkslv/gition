@@ -6,3 +6,4 @@
 /web/.wrangler
 /web/.dev.vars
 node_modules
+/.playwright-mcp

@@ -12,10 +12,11 @@ use anyhow::{Result, anyhow};
 use gition::app::App;
 use gition::config::{Config, FILE_NAME};
 use gition::images::Images;
-use gition::keymap::Action;
+use gition::keymap::{Action, KeySpec};
 use gition::repo;
 use gition::storage::Storage;
 use ratatui_textarea::{Input, Key};
+use ratzilla::DomBackend;
 use ratzilla::ratatui::Frame;
 use ratzilla::ratatui::Terminal;
 use ratzilla::ratatui::backend::{Backend, ClearType, WindowSize};
@@ -25,11 +26,10 @@ use ratzilla::ratatui::layout::{Position, Size};
 use ratzilla::ratatui::style::{Color, Modifier, Style};
 use ratzilla::ratatui::text::Line;
 use ratzilla::ratatui::widgets::{Block, Clear, Paragraph, Wrap};
-use ratzilla::{DomBackend, WebEventHandler, WebRenderer};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BeforeUnloadEvent, ClipboardEvent, KeyboardEvent};
+use web_sys::{BeforeUnloadEvent, ClipboardEvent, Event, HtmlElement, HtmlTextAreaElement, InputEvent, KeyboardEvent};
 
 use crate::github::{Api, Session, status};
 use crate::workspace::{Ctx, WebHost, get_item, set_item};
@@ -78,9 +78,34 @@ fn main() {
         {
             let _ = wasm_bindgen_futures::JsFuture::from(ready).await;
         }
-        let terminal = Terminal::new(Grid(DomBackend::new().expect("DOM backend"))).expect("terminal");
-        terminal.draw_web(move |f| draw(f, &screen));
+        let grid = Grid { dom: DomBackend::new_by_id("term").expect("DOM backend"), grid: None };
+        run(Terminal::new(grid).expect("terminal"), screen);
     });
+}
+
+/// Draws a frame on every animation frame, like Ratzilla's `draw_web`, but lets the DOM
+/// backend rebuild its grid first and then redraws everything when it did.
+fn run(mut terminal: Terminal<Grid>, screen: Shared) {
+    let frame: FrameCallback = Rc::default();
+    let next = frame.clone();
+    *frame.borrow_mut() = Some(Closure::new(move || {
+        if terminal.backend_mut().sync() {
+            let _ = terminal.clear();
+        }
+        if let Err(e) = terminal.draw(|f| draw(f, &screen)) {
+            web_sys::console::error_1(&e.to_string().into());
+        }
+        request_frame(&next);
+    }));
+    request_frame(&frame);
+}
+
+type FrameCallback = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
+fn request_frame(f: &FrameCallback) {
+    if let Some(cb) = &*f.borrow() {
+        let _ = window().request_animation_frame(cb.as_ref().unchecked_ref());
+    }
 }
 
 // ---- startup ----------------------------------------------------------------
@@ -220,12 +245,20 @@ fn on_key(screen: &Shared, e: &KeyboardEvent) {
     if e.is_composing() {
         return;
     }
-    let Some(input) = to_input(e) else { return };
+    if let Some(input) = to_input(e)
+        && handle(screen, input)
+    {
+        e.prevent_default();
+    }
+}
+
+/// Runs one key through the current screen; true when gition used it.
+fn handle(screen: &Shared, input: Input) -> bool {
     let plain = !input.ctrl && !input.alt && !matches!(input.key, Key::F(_));
     let mut then = Then::Nothing;
-    {
+    let handled = {
         let mut s = screen.borrow_mut();
-        let handled = match &mut *s {
+        match &mut *s {
             Screen::App(app, _) => {
                 // Leave browser shortcuts (copy, paste, reload, …) alone unless gition binds them.
                 let bound = Action::ALL.iter().any(|&a| app.keys.is(a, &input));
@@ -284,11 +317,8 @@ fn on_key(screen: &Shared, e: &KeyboardEvent) {
                 true
             }
             _ => false,
-        };
-        if handled {
-            e.prevent_default();
         }
-    }
+    };
     let screen = screen.clone();
     match then {
         Then::Nothing => {}
@@ -335,6 +365,7 @@ fn on_key(screen: &Shared, e: &KeyboardEvent) {
             }
         }),
     }
+    handled
 }
 
 fn listen(screen: &Shared) {
@@ -372,17 +403,140 @@ fn listen(screen: &Shared) {
     paste.forget();
     unload.forget();
     hashchange.forget();
+    listen_touch(screen);
+}
+
+/// A phone or tablet: no physical keyboard to expect.
+fn touch() -> bool {
+    window().match_media("(hover: none) and (pointer: coarse)").ok().flatten().is_some_and(|m| m.matches())
+}
+
+fn element<T: JsCast>(id: &str) -> Option<T> {
+    window().document()?.get_element_by_id(id)?.dyn_into().ok()
+}
+
+/// Phones: the key bar, the on-screen keyboard and the visual viewport.
+fn listen_touch(screen: &Shared) {
+    let w = window();
+    let Some(kbd) = element::<HtmlTextAreaElement>("kbd") else { return };
+
+    // The bar sends keys a phone keyboard doesn't have; ⌨ shows or hides the keyboard.
+    // Cancelling mousedown keeps the focus, and so the keyboard, where it is; the click still comes.
+    if let Some(bar) = element::<HtmlElement>("bar") {
+        let keep_focus = Closure::<dyn FnMut(Event)>::new(|e: Event| e.prevent_default());
+        let _ = bar.add_event_listener_with_callback("mousedown", keep_focus.as_ref().unchecked_ref());
+        keep_focus.forget();
+        let s = screen.clone();
+        let k = kbd.clone();
+        let click = Closure::<dyn FnMut(Event)>::new(move |e: Event| {
+            let Some(key) = e
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .and_then(|t| t.closest("[data-key]").ok().flatten())
+                .and_then(|t| t.get_attribute("data-key"))
+            else {
+                return;
+            };
+            if key == "kbd" {
+                let focused = window().document().and_then(|d| d.active_element());
+                if focused.is_some_and(|f| f.is_same_node(Some(&k))) {
+                    let _ = k.blur();
+                } else {
+                    let _ = k.focus();
+                }
+            } else if let Ok(spec) = KeySpec::parse(&key) {
+                handle(&s, Input { key: spec.key, ctrl: spec.ctrl, alt: spec.alt, shift: spec.shift });
+            }
+        });
+        let _ = bar.add_event_listener_with_callback("click", click.as_ref().unchecked_ref());
+        click.forget();
+    }
+
+    // Typing on the on-screen keyboard. Keys with a real `key` already arrived as keydown and
+    // were cancelled there; this catches the rest (predictive text, autocorrect, dictation).
+    let s = screen.clone();
+    let k = kbd.clone();
+    let input = Closure::<dyn FnMut(InputEvent)>::new(move |e: InputEvent| {
+        if e.is_composing() {
+            return;
+        }
+        e.prevent_default();
+        let keys: Vec<Key> = match e.input_type().as_str() {
+            "insertText" | "insertReplacementText" => e.data().unwrap_or_default().chars().map(Key::Char).collect(),
+            "insertLineBreak" | "insertParagraph" => vec![Key::Enter],
+            "deleteContentBackward" => vec![Key::Backspace],
+            "deleteContentForward" => vec![Key::Delete],
+            _ => vec![],
+        };
+        for key in keys {
+            handle(&s, Input { key, ..Input::default() });
+        }
+        k.set_value("");
+    });
+    let _ = kbd.add_event_listener_with_callback("beforeinput", input.as_ref().unchecked_ref());
+    input.forget();
+
+    // Tapping the sign-in screen signs in, since there's no Enter key to press.
+    if let Some(term) = element::<HtmlElement>("term") {
+        let s = screen.clone();
+        let tap = Closure::<dyn FnMut()>::new(move || {
+            let login = matches!(&*s.borrow(), Screen::Login);
+            if login {
+                handle(&s, Input { key: Key::Enter, ..Input::default() });
+            }
+        });
+        let _ = term.add_event_listener_with_callback("click", tap.as_ref().unchecked_ref());
+        tap.forget();
+    }
+
+    // The on-screen keyboard shrinks the visual viewport only: fit the page to it, and tell
+    // the DOM backend to rebuild its grid (it listens for window resizes).
+    if let Some(vv) = w.visual_viewport() {
+        let fit = Closure::<dyn FnMut()>::new(move || {
+            let w = window();
+            let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else {
+                return;
+            };
+            let height = format!("{}px", vv.height());
+            if body.style().get_property_value("height").ok().as_deref() != Some(height.as_str()) {
+                let _ = body.style().set_property("height", &height);
+                w.scroll_to_with_x_and_y(0.0, 0.0);
+                if let Ok(e) = Event::new("resize") {
+                    let _ = w.dispatch_event(&e);
+                }
+            }
+        });
+        let _ = vv.add_event_listener_with_callback("resize", fit.as_ref().unchecked_ref());
+        fit.forget();
+    }
 }
 
 // ---- drawing ------------------------------------------------------------------
 
-/// `DomBackend`, but reporting the size of the grid it actually drew. Ratzilla 0.3's
-/// `size()` assumes a fixed cell size, so the frame doesn't fill the window.
-struct Grid(DomBackend);
+/// `DomBackend`, but reporting the size of the grid it actually built. Ratzilla 0.3's
+/// `size()` guesses from the window (or, on phones, the whole screen), which is bigger than
+/// the grid and made the first frame write past its end.
+struct Grid {
+    dom: DomBackend,
+    /// The grid element of the last frame, to notice when the backend rebuilt it.
+    grid: Option<web_sys::Element>,
+}
 
 impl Grid {
-    fn drawn_size() -> Option<Size> {
-        let grid = window().document()?.get_element_by_id("grid")?;
+    const ID: &str = "term_ratzilla_grid";
+
+    /// Lets the backend (re)build its grid, which it does lazily on the first draw and after
+    /// a resize. True when it did, so the whole screen needs drawing again.
+    fn sync(&mut self) -> bool {
+        let _ = self.dom.draw(std::iter::empty());
+        let grid = window().document().and_then(|d| d.get_element_by_id(Self::ID));
+        let rebuilt = grid != self.grid;
+        self.grid = grid;
+        rebuilt
+    }
+
+    fn drawn_size(&self) -> Option<Size> {
+        let grid = self.grid.as_ref()?;
         let cols = grid.first_element_child()?.child_element_count() as u16;
         Some(Size::new(cols, grid.child_element_count() as u16)).filter(|s| s.width > 0)
     }
@@ -392,60 +546,36 @@ impl Backend for Grid {
     type Error = std::io::Error;
 
     fn draw<'a, I: Iterator<Item = (u16, u16, &'a Cell)>>(&mut self, content: I) -> std::io::Result<()> {
-        // Cells outside the grid (for one frame after a resize) have nowhere to go.
+        // Cells outside the grid have nowhere to go.
         let size = self.size()?;
-        self.0.draw(content.filter(|(x, y, _)| *x < size.width && *y < size.height))
+        self.dom.draw(content.filter(|(x, y, _)| *x < size.width && *y < size.height))
     }
     fn hide_cursor(&mut self) -> std::io::Result<()> {
-        self.0.hide_cursor()
+        self.dom.hide_cursor()
     }
     fn show_cursor(&mut self) -> std::io::Result<()> {
-        self.0.show_cursor()
+        self.dom.show_cursor()
     }
     fn get_cursor_position(&mut self) -> std::io::Result<Position> {
-        self.0.get_cursor_position()
+        self.dom.get_cursor_position()
     }
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
-        self.0.set_cursor_position(position)
+        self.dom.set_cursor_position(position)
     }
     fn clear(&mut self) -> std::io::Result<()> {
-        self.0.clear()
+        self.dom.clear()
     }
     fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
-        self.0.clear_region(clear_type)
+        self.dom.clear_region(clear_type)
     }
     fn size(&self) -> std::io::Result<Size> {
-        match Self::drawn_size() {
-            Some(s) => Ok(s),
-            None => self.0.size(),
-        }
+        Ok(self.drawn_size().unwrap_or_default())
     }
     fn window_size(&mut self) -> std::io::Result<WindowSize> {
-        self.0.window_size()
+        self.dom.window_size()
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl WebEventHandler for Grid {
-    fn on_mouse_event<F: FnMut(ratzilla::event::MouseEvent) + 'static>(
-        &mut self,
-        f: F,
-    ) -> Result<(), ratzilla::error::Error> {
-        self.0.on_mouse_event(f)
-    }
-    fn clear_mouse_events(&mut self) {
-        self.0.clear_mouse_events()
-    }
-    fn on_key_event<F: FnMut(ratzilla::event::KeyEvent) + 'static>(
-        &mut self,
-        f: F,
-    ) -> Result<(), ratzilla::error::Error> {
-        self.0.on_key_event(f)
-    }
-    fn clear_key_events(&mut self) {
-        self.0.clear_key_events()
+        self.dom.flush()
     }
 }
 
@@ -490,7 +620,10 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
             vec![
                 Line::raw("A notebook stored as markdown in a GitHub repo."),
                 Line::raw(""),
-                Line::styled("Press Enter to sign in with GitHub", Style::new().add_modifier(Modifier::BOLD)),
+                Line::styled(
+                    if touch() { "Tap to sign in with GitHub" } else { "Press Enter to sign in with GitHub" },
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
                 Line::raw(""),
                 hint("Notes go straight from your browser to GitHub; this server stores nothing."),
                 hint("gition only sees the repos you install the app on."),
@@ -564,7 +697,10 @@ fn theme(c: Color, bg: bool) -> Color {
 fn dialog(f: &mut Frame, title: &str, lines: Vec<Line>) {
     let area = f.area();
     let w = 72.min(area.width);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    // Count wrapped rows so narrow screens don't cut the last lines off.
+    let inner = w.saturating_sub(2).max(1) as usize;
+    let rows: usize = lines.iter().map(|l| l.width().div_ceil(inner).max(1)).sum();
+    let h = (rows as u16 + 2).min(area.height);
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 3, w, h);
     f.render_widget(Clear, r);
     let block = Block::bordered().title(format!(" {title} ")).border_style(Style::new().fg(Color::Cyan));

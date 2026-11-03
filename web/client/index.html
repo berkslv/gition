@@ -2,7 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#0f1115" />
     <title>gition</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%2388c0d0'/><path d='M4 4h8M4 8h8M4 12h5' stroke='%230f1115' stroke-width='2'/></svg>" />
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="0" />
@@ -18,13 +22,93 @@
         font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
         font-size: 15px;
       }
+      body {
+        display: flex;
+        flex-direction: column;
+        /* Updated from visualViewport so the on-screen keyboard doesn't cover the grid. */
+        height: 100dvh;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+        box-sizing: border-box;
+      }
+      #term {
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+      }
       /* Ratzilla draws each row as a <pre>; drop the browser's margins so rows touch. */
       pre {
         margin: 0;
         font: inherit;
         line-height: normal;
       }
+      /* Receives the on-screen keyboard. 16px stops iOS from zooming in on focus. */
+      #kbd {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        border: 0;
+        padding: 0;
+        font-size: 16px;
+        resize: none;
+      }
+      /* Keys a phone keyboard doesn't have. Only on touch screens. */
+      #bar {
+        display: none;
+        gap: 3px;
+        padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+        background: #1a1d24;
+        border-top: 1px solid #2e3440;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #bar button {
+        flex: 1 1 0;
+        min-width: 0;
+        height: 40px;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: #2e3440;
+        color: #d8dee9;
+        font: inherit;
+        font-size: 13px;
+        touch-action: manipulation;
+      }
+      #bar button:active {
+        background: #4c566a;
+      }
+      @media (hover: none) and (pointer: coarse) {
+        #bar {
+          display: flex;
+        }
+      }
+      @media (max-width: 600px) {
+        html,
+        body {
+          font-size: 13px;
+        }
+      }
     </style>
   </head>
-  <body></body>
+  <body>
+    <div id="term"></div>
+    <div id="bar">
+      <button data-key="kbd" aria-label="Keyboard">⌨</button>
+      <button data-key="esc">Esc</button>
+      <button data-key="tab">Tab</button>
+      <button data-key="up" aria-label="Up">↑</button>
+      <button data-key="down" aria-label="Down">↓</button>
+      <button data-key="left" aria-label="Left">←</button>
+      <button data-key="right" aria-label="Right">→</button>
+      <button data-key="enter" aria-label="Enter">⏎</button>
+      <button data-key="ctrl+s">Save</button>
+      <button data-key="ctrl+g">Sync</button>
+      <button data-key="ctrl+b">Tree</button>
+      <button data-key="?">?</button>
+    </div>
+    <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+  </body>
 </html>
