@@ -8,6 +8,11 @@ gition is a Rust TUI notebook: a markdown page tree, a viewer and an editor, wit
 - `cargo clippy --all-targets` and `cargo fmt`. Formatting uses `rustfmt.toml` (width 120).
 - UI snapshots live in `tests/snapshots/`. Review changes with `cargo insta review`, or regenerate them with `INSTA_UPDATE=always cargo test`.
 
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then `git tag -a vX.Y.Z -m vX.Y.Z && git push origin main vX.Y.Z`.
+`.github/workflows/release.yml` checks that the tag matches the version, runs the tests, builds the binaries, creates the GitHub Release and publishes to crates.io through Trusted Publishing. Never run `cargo publish` by hand.
+
 ## Layout
 
 - `main.rs`: arguments, repo discovery and the init prompt, the terminal loop.

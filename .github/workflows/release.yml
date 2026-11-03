@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.1.0 to build binaries and publish a GitHub Release.
+# Push a tag like v0.1.0 to test, build binaries, publish a GitHub Release
+# and publish the crate to crates.io (via Trusted Publishing, no stored token).
 on:
   push:
     tags: ["v*"]
@@ -9,7 +10,27 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo publish --dry-run --locked
+
   build:
+    needs: check
     strategy:
       matrix:
         include:
@@ -59,3 +80,18 @@ jobs:
           files: |
             gition-*
             SHA256SUMS
+
+  crates-io:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
