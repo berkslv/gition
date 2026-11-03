@@ -1,11 +1,15 @@
 pub mod app;
 pub mod config;
+#[cfg(feature = "native")]
 pub mod git;
+pub mod host;
 pub mod images;
 pub mod keymap;
 pub mod links;
 pub mod markdown;
 pub mod paths;
 pub mod repo;
+pub mod storage;
+pub mod sync;
 pub mod tree;
 pub mod ui;

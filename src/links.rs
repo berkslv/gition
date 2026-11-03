@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
 
 use crate::paths;
+use crate::storage::Storage;
 
 pub fn md_options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
@@ -133,12 +134,12 @@ pub fn rewrite(src: &str, file_old: &Path, file_new: &Path, old: &Path, new: &Pa
 }
 
 /// Number of markdown files (outside `target`) that link to `target` or into it.
-pub fn count_incoming(root: &Path, target: &Path, md_files: &[PathBuf]) -> usize {
+pub fn count_incoming(fs: &dyn Storage, target: &Path, md_files: &[PathBuf]) -> usize {
     md_files
         .iter()
         .filter(|f| !f.starts_with(target))
         .filter(|f| {
-            let Ok(src) = std::fs::read_to_string(root.join(f)) else { return false };
+            let Ok(src) = fs.read_to_string(f) else { return false };
             find_links(&src).iter().filter_map(|l| resolve(f, &l.dest)).any(|(t, _)| t.starts_with(target))
         })
         .count()

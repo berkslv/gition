@@ -1,0 +1,16 @@
+# gition web: the static frontend (client/) and the sign-in worker (server/) in one Worker.
+# Build first (`trunk build --release` in client/, `worker-build --release` in server/),
+# then `npx wrangler dev` or `npx wrangler deploy` from this directory.
+name = "gition"
+main = "server/build/index.js"
+compatibility_date = "2026-11-01"
+routes = [{ pattern = "gition.berkslv.com", custom_domain = true }]
+
+# Files in client/dist are served as-is; everything else (/auth/*) goes to the worker.
+[assets]
+directory = "client/dist"
+
+[vars]
+# From the GitHub App's settings page. Secrets: GITHUB_CLIENT_SECRET, SESSION_KEY.
+GITHUB_CLIENT_ID = "Iv23liW255JFFCs3qPNX"
+GITHUB_APP_SLUG = "gition-notes"

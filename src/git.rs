@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow};
 
+use crate::sync::committed;
+pub use crate::sync::{Change, Remote, State, commit_message};
+
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
@@ -38,21 +41,6 @@ pub fn is_repo(dir: &Path) -> bool {
 
 pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     run(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim()))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Remote {
-    None,
-    NoUpstream,
-    Tracking { ahead: usize, behind: usize },
-    Offline(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct State {
-    pub remote: Remote,
-    /// Number of uncommitted changed paths under the gition root.
-    pub changes: usize,
 }
 
 fn remotes(root: &Path) -> Vec<String> {
@@ -101,14 +89,6 @@ pub fn fetch_and_fast_forward(root: &Path) -> (State, usize) {
     (st, 0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
-    Added(String),
-    Modified(String),
-    Deleted(String),
-    Renamed(String, String),
-}
-
 /// Parses `git diff --name-status -z` output.
 pub fn parse_name_status(z: &str) -> Vec<Change> {
     let mut out = Vec::new();
@@ -127,19 +107,6 @@ pub fn parse_name_status(z: &str) -> Vec<Change> {
         }
     }
     out
-}
-
-pub fn commit_message(prefix: &str, changes: &[Change]) -> String {
-    let parts: Vec<String> = changes
-        .iter()
-        .map(|c| match c {
-            Change::Added(p) => format!("add {p}"),
-            Change::Modified(p) => format!("edit {p}"),
-            Change::Deleted(p) => format!("delete {p}"),
-            Change::Renamed(a, b) => format!("rename {a} -> {b}"),
-        })
-        .collect();
-    format!("{prefix} {}", parts.join(", ")).trim().to_string()
 }
 
 fn rebase_in_progress(root: &Path) -> bool {
@@ -162,11 +129,7 @@ pub fn sync(root: &Path, prefix: &str) -> Result<String> {
     if !changes.is_empty() {
         run(root, &["commit", "-q", "-m", &commit_message(prefix, &changes)])?;
     }
-    let committed = match changes.len() {
-        0 => "nothing to commit".to_string(),
-        1 => "committed 1 file".to_string(),
-        n => format!("committed {n} files"),
-    };
+    let committed = committed(changes.len());
     let remotes = remotes(root);
     let Some(remote) = remotes.first() else {
         return Ok(format!("No remote, {committed} locally"));

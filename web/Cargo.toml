@@ -1,0 +1,13 @@
+[workspace]
+members = ["client", "server"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

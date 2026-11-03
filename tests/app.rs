@@ -2,13 +2,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gition::app::App;
 use gition::config::Config;
+use gition::host::{Host, Msg, Open};
+use gition::images::Images;
+use gition::storage::{Blob, Files, MemStorage, Storage};
 use gition::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui_textarea::{Input, Key};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let p = root.join(rel);
@@ -27,13 +32,13 @@ fn workspace() -> (tempfile::TempDir, PathBuf) {
     (tmp, root)
 }
 
-fn key(app: &mut App, code: KeyCode) {
-    app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+fn key(app: &mut App, key: Key) {
+    app.on_key(Input { key, ..Input::default() });
 }
 
 fn typ(app: &mut App, s: &str) {
     for c in s.chars() {
-        key(app, KeyCode::Char(c));
+        key(app, Key::Char(c));
     }
 }
 
@@ -51,7 +56,7 @@ fn select(app: &mut App, path: &str) {
 #[test]
 fn renders_tree_and_page() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root, Config::default(), None);
+    let mut app = App::open_dir(root, Config::default(), None);
     let t = render(&mut app);
     insta::assert_snapshot!(t.backend());
 }
@@ -59,17 +64,17 @@ fn renders_tree_and_page() {
 #[test]
 fn rename_moves_page_and_rewrites_links() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root.clone(), Config::default(), None);
-    key(&mut app, KeyCode::Enter); // expand root -> opens INDEX
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
+    key(&mut app, Key::Enter); // expand root -> opens INDEX
     select(&mut app, "Projects");
-    key(&mut app, KeyCode::Enter);
+    key(&mut app, Key::Enter);
     select(&mut app, "Projects/plan.md");
-    key(&mut app, KeyCode::Char('r'));
+    key(&mut app, Key::Char('r'));
     for _ in 0.."Projects/plan".len() {
-        key(&mut app, KeyCode::Backspace);
+        key(&mut app, Key::Backspace);
     }
     typ(&mut app, "Archive/old plan");
-    key(&mut app, KeyCode::Enter);
+    key(&mut app, Key::Enter);
 
     assert!(root.join("Archive/old plan.md").exists());
     assert!(!root.join("Projects/plan.md").exists());
@@ -83,15 +88,15 @@ fn rename_moves_page_and_rewrites_links() {
 #[test]
 fn new_page_opens_editor_and_saves() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root.clone(), Config::default(), None);
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
     select(&mut app, "Projects");
-    key(&mut app, KeyCode::Char('n'));
+    key(&mut app, Key::Char('n'));
     typ(&mut app, "Roadmap");
-    key(&mut app, KeyCode::Enter);
+    key(&mut app, Key::Enter);
     assert!(app.editor.is_some());
     typ(&mut app, "q1 goals");
-    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-    key(&mut app, KeyCode::Esc);
+    app.on_key(Input { key: Key::Char('s'), ctrl: true, ..Input::default() });
+    key(&mut app, Key::Esc);
     assert!(app.editor.is_none());
     assert_eq!(fs::read_to_string(root.join("Projects/Roadmap.md")).unwrap(), "# Roadmap\nq1 goals");
 }
@@ -99,14 +104,14 @@ fn new_page_opens_editor_and_saves() {
 #[test]
 fn escape_with_unsaved_changes_asks() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root.clone(), Config::default(), None);
-    key(&mut app, KeyCode::Tab);
-    key(&mut app, KeyCode::Char('e'));
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
+    key(&mut app, Key::Tab);
+    key(&mut app, Key::Char('e'));
     typ(&mut app, "x");
-    key(&mut app, KeyCode::Esc);
+    key(&mut app, Key::Esc);
     let t = render(&mut app);
     assert!(format!("{:?}", t.backend()).contains("Save changes?"));
-    key(&mut app, KeyCode::Char('n'));
+    key(&mut app, Key::Char('n'));
     assert!(app.editor.is_none());
     assert!(fs::read_to_string(root.join("INDEX.md")).unwrap().starts_with("# Notes"));
 }
@@ -114,12 +119,12 @@ fn escape_with_unsaved_changes_asks() {
 #[test]
 fn delete_warns_about_incoming_links() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root.clone(), Config::default(), None);
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
     select(&mut app, "ideas.md");
-    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, Key::Char('d'));
     let t = render(&mut app);
     assert!(format!("{:?}", t.backend()).contains("2 pages link here"));
-    key(&mut app, KeyCode::Char('y'));
+    key(&mut app, Key::Char('y'));
     assert!(!root.join("ideas.md").exists());
 }
 
@@ -128,12 +133,12 @@ fn insert_image_copies_into_assets() {
     let (tmp, root) = workspace();
     let src = tmp.path().join("photo shot.png");
     fs::write(&src, "png bytes").unwrap();
-    let mut app = App::new(root.clone(), Config::default(), None);
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
     select(&mut app, "Projects");
-    key(&mut app, KeyCode::Enter); // opens Projects/INDEX.md
-    key(&mut app, KeyCode::Char('i'));
+    key(&mut app, Key::Enter); // opens Projects/INDEX.md
+    key(&mut app, Key::Char('i'));
     app.on_paste(format!("\"{}\"", src.display()));
-    key(&mut app, KeyCode::Enter);
+    key(&mut app, Key::Enter);
     assert_eq!(fs::read(root.join("assets/photo shot.png")).unwrap(), b"png bytes");
     let page = fs::read_to_string(root.join("Projects/INDEX.md")).unwrap();
     assert_eq!(page, "# Projects\n\n![photo shot](../assets/photo%20shot.png)\n");
@@ -142,10 +147,59 @@ fn insert_image_copies_into_assets() {
 #[test]
 fn search_opens_page() {
     let (_tmp, root) = workspace();
-    let mut app = App::new(root, Config::default(), None);
-    key(&mut app, KeyCode::Char('/'));
+    let mut app = App::open_dir(root, Config::default(), None);
+    key(&mut app, Key::Char('/'));
     typ(&mut app, "plan");
-    key(&mut app, KeyCode::Enter);
+    key(&mut app, Key::Enter);
     assert_eq!(app.page.as_ref().unwrap().path, Path::new("Projects/plan.md"));
     assert_eq!(app.visible[app.sel].path, Path::new("Projects/plan.md"));
+}
+
+/// A host that never syncs, for running the app on an in-memory working copy like the web build.
+struct Offline;
+
+impl Host for Offline {
+    fn fetch(&self, _tx: Sender<Msg>) {}
+    fn sync(&self, _prefix: &str, _tx: Sender<Msg>) {}
+    fn changes(&self) -> usize {
+        0
+    }
+    fn open(&self, _target: Open) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn works_on_in_memory_storage() {
+    let files: Files = [
+        ("INDEX.md", "# Notes\n\n[the plan](Projects/plan.md)\n"),
+        ("Projects/INDEX.md", "# Projects\n"),
+        ("Projects/plan.md", "# Plan\n\n[home](../INDEX.md)\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (PathBuf::from(p), Blob::Data(c.as_bytes().to_vec())))
+    .collect();
+    let fs = Rc::new(MemStorage::new("notes", files));
+    let mut app =
+        App::new(Box::new(fs.clone()), Box::new(Offline), Config::default(), Images::new(PathBuf::new(), None));
+    key(&mut app, Key::Enter);
+    select(&mut app, "Projects");
+    key(&mut app, Key::Enter);
+    select(&mut app, "Projects/plan.md");
+    key(&mut app, Key::Char('r'));
+    for _ in 0.."Projects/plan".len() {
+        key(&mut app, Key::Backspace);
+    }
+    typ(&mut app, "plan");
+    key(&mut app, Key::Enter);
+
+    let read = |p: &str| fs.read_to_string(Path::new(p)).unwrap();
+    assert_eq!(read("INDEX.md"), "# Notes\n\n[the plan](plan.md)\n");
+    assert_eq!(read("plan.md"), "# Plan\n\n[home](INDEX.md)\n");
+    assert!(!fs.exists(Path::new("Projects/plan.md")));
+
+    select(&mut app, "Projects");
+    key(&mut app, Key::Char('d'));
+    key(&mut app, Key::Char('y'));
+    assert!(!fs.exists(Path::new("Projects")));
 }

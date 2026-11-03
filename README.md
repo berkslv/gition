@@ -42,6 +42,15 @@ gition walks up from the current directory to the nearest `INDEX.md`. If there i
 - Moving or renaming a page rewrites every relative link to and from it.
 - `Ctrl+G` saves, runs `git add -A`, commits with a message listing the changed files, then pulls with `--rebase` and pushes. On startup gition fetches, and fast-forwards when that's safe.
 
+## Web
+
+The same app also runs in the browser on a GitHub repo, with no local clone. It's in `web/` and deploys to Cloudflare Workers.
+
+- Sign in with GitHub, install the gition GitHub App on the repos you want, and pick one. Open `/#owner/repo` to go straight to a repo, or `/#repos` to switch.
+- `Ctrl+S` saves to the browser's working copy, which survives reloads. `Ctrl+G` commits every change in one commit through the GitHub API. If someone pushed in between, gition replays your changes on top of theirs. When both sides changed the same file, it keeps their version and saves yours next to it as `name.conflict.md`.
+- `i` opens a file picker, and `o` opens the file on GitHub. Images show as placeholders.
+- Privacy: your notes go straight from your browser to GitHub. The Worker only handles sign-in and keeps nothing: your GitHub tokens live in an encrypted cookie in your browser. gition can only reach the repos you install the [gition-notes](https://github.com/apps/gition-notes) App on, and you can remove it any time in your GitHub settings.
+
 ## Keys
 
 | Where  | Keys |

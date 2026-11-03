@@ -8,6 +8,7 @@ use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event,
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
+use ratatui_textarea::Input;
 
 use gition::app::App;
 use gition::config::Config;
@@ -79,7 +80,7 @@ fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     let picker = Picker::from_query_stdio().ok();
-    let mut app = App::new(root.clone(), cfg, picker);
+    let mut app = App::open_dir(root.clone(), cfg, picker);
     app.start_fetch();
     let result = event_loop(&mut terminal, &mut app);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
@@ -99,7 +100,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 // Windows also reports key releases; only act on presses.
-                Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
+                Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(Input::from(k)),
                 Event::Paste(s) => app.on_paste(s),
                 _ => {}
             }

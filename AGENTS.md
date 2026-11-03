@@ -6,6 +6,8 @@ gition is a Rust TUI notebook: a markdown page tree, a viewer and an editor, wit
 
 - `cargo test`: unit tests, plus integration tests in `tests/`. The integration tests need `git` on PATH.
 - `cargo clippy --all-targets` and `cargo fmt`. Formatting uses `rustfmt.toml` (width 120).
+- `cargo clippy --lib --no-default-features --target wasm32-unknown-unknown` checks that the shared code builds for the web.
+- In `web/`: `cargo clippy --target wasm32-unknown-unknown --all-targets`. To run it locally, build with `trunk build --release` in `web/client` and `worker-build --release` in `web/server`, then run `npx wrangler dev` in `web/`. Restart `wrangler dev` after each rebuild, because it snapshots the asset list. This needs `cargo install trunk worker-build` and a `web/.dev.vars` with the secrets.
 - UI snapshots live in `tests/snapshots/`. Review changes with `cargo insta review`, or regenerate them with `INSTA_UPDATE=always cargo test`.
 
 ## Releasing
@@ -13,15 +15,25 @@ gition is a Rust TUI notebook: a markdown page tree, a viewer and an editor, wit
 Bump `version` in `Cargo.toml`, commit, then `git tag -a vX.Y.Z -m vX.Y.Z && git push origin main vX.Y.Z`.
 `.github/workflows/release.yml` checks that the tag matches the version, runs the tests, builds the binaries, creates the GitHub Release and publishes to crates.io through Trusted Publishing. Never run `cargo publish` by hand.
 
+## Web deploy
+
+`.github/workflows/web.yml` deploys `web/` with `wrangler deploy` on every push to main, once the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set. The Worker needs the vars `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG` in `web/wrangler.toml`, plus the secrets `GITHUB_CLIENT_SECRET` and `SESSION_KEY` (`npx wrangler secret put NAME`).
+
 ## Layout
 
+`src/` is shared by the terminal app and the web app. The `native` feature (on by default) adds the terminal frontend, the git CLI and inline images. Without it, the library builds for `wasm32`.
+
 - `main.rs`: arguments, repo discovery and the init prompt, the terminal loop.
-- `app.rs`: all state and key handling. Actions come from the keymap; keys are never hardcoded.
+- `app.rs`: all state and key handling. Actions come from the keymap; keys are never hardcoded. Repo files go through `Storage` and sync goes through `Host`, never `std::fs` or git directly.
+- `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy.
+- `host.rs`: the `Host` trait (fetch, sync, open externally, file picker). `GitHost` is the git CLI. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
 - `ui.rs`: drawing only. Must not mutate files.
 - `markdown.rs`: pulldown-cmark to styled `Block`s, plus `wrap`.
 - `links.rs`: finding and rewriting inline links. Used by rename/move and the delete warning.
 - `git.rs`: shells out to the `git` CLI. Don't use `git2`/`gix`.
 - `tree.rs`, `paths.rs`, `repo.rs`, `config.rs`, `keymap.rs`, `images.rs`.
+- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and `main.rs` handles sign-in, the repo picker and keyboard input.
+- `web/server`: the Worker. It only handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie.
 
 ## Rules
 

@@ -1,30 +1,30 @@
 //! Application state and input handling.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use ratatui::layout::Size;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
-use ratatui_image::picker::Picker;
-use ratatui_textarea::{CursorMove, TextArea, WrapMode};
+use ratatui_textarea::{CursorMove, Input, Key, TextArea, WrapMode};
+use web_time::Instant;
 
 use crate::config::Config;
-use crate::git;
+use crate::host::{Host, Msg, Open};
 use crate::images::Images;
 use crate::keymap::{Action, Keymap};
 use crate::links;
 use crate::markdown::{self, Block};
 use crate::paths;
 use crate::repo::{self, INDEX};
+use crate::storage::Storage;
+use crate::sync::State;
 use crate::tree::{self, Filter, Node, Visible};
 
 /// Images are capped at this many rows in the viewer.
@@ -110,13 +110,9 @@ pub enum Modal {
     Help,
 }
 
-pub enum Msg {
-    Fetched(git::State, usize),
-    Synced(Result<String, String>, git::State),
-}
-
 pub struct App {
-    pub root: PathBuf,
+    pub fs: Box<dyn Storage>,
+    pub host: Box<dyn Host>,
     pub cfg: Config,
     pub keys: Keymap,
     pub tree: Node,
@@ -130,10 +126,12 @@ pub struct App {
     pub editor: Option<Editor>,
     pub view: View,
     pub modal: Modal,
-    pub git: Option<git::State>,
+    pub git: Option<State>,
     pub busy: bool,
     pub message: Option<(String, bool, Instant)>,
     pub images: Images,
+    /// Page waiting for an image from the host's file picker.
+    pending_image: Option<PathBuf>,
     tree_wide: bool,
     tree_narrow: bool,
     pub width: u16,
@@ -180,12 +178,22 @@ const EDIT: &[Action] = &[
 ];
 
 impl App {
-    pub fn new(root: PathBuf, cfg: Config, picker: Option<Picker>) -> App {
+    /// A gition repo on disk, synced with the git CLI.
+    #[cfg(feature = "native")]
+    pub fn open_dir(root: PathBuf, cfg: Config, picker: Option<ratatui_image::picker::Picker>) -> App {
+        use crate::host::GitHost;
+        use crate::storage::FsStorage;
+        let images = Images::new(root.clone(), picker);
+        App::new(Box::new(FsStorage::new(root.clone())), Box::new(GitHost { root }), cfg, images)
+    }
+
+    pub fn new(fs: Box<dyn Storage>, host: Box<dyn Host>, cfg: Config, images: Images) -> App {
         let (keys, warnings) = Keymap::from_config(&cfg);
         let (tx, rx) = channel();
         let mut app = App {
             show_all: cfg.show_all_files,
-            root,
+            fs,
+            host,
             cfg,
             keys,
             tree: Node { path: PathBuf::new(), name: String::new(), is_dir: true, children: Vec::new() },
@@ -201,7 +209,8 @@ impl App {
             git: None,
             busy: false,
             message: None,
-            images: Images::new(picker),
+            images,
+            pending_image: None,
             tree_wide: true,
             tree_narrow: false,
             width: 80,
@@ -217,16 +226,11 @@ impl App {
         app
     }
 
-    // ---- background git ------------------------------------------------
+    // ---- background sync -----------------------------------------------
 
     pub fn start_fetch(&mut self) {
         self.busy = true;
-        let root = self.root.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let (state, pulled) = git::fetch_and_fast_forward(&root);
-            let _ = tx.send(Msg::Fetched(state, pulled));
-        });
+        self.host.fetch(self.tx.clone());
     }
 
     fn sync(&mut self) {
@@ -239,16 +243,10 @@ impl App {
             return self.error(e.to_string());
         }
         self.busy = true;
-        let root = self.root.clone();
-        let prefix = self.cfg.commit_prefix.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = git::sync(&root, &prefix).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Synced(res, git::state(&root)));
-        });
+        self.host.sync(&self.cfg.commit_prefix, self.tx.clone());
     }
 
-    /// Applies results from background threads. Call once per loop iteration.
+    /// Applies results from background work. Call once per loop iteration.
     pub fn tick(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             self.busy = false;
@@ -285,7 +283,7 @@ impl App {
     /// Recounts local changes after a file operation.
     fn refresh_changes(&mut self) {
         if let Some(st) = &mut self.git {
-            st.changes = git::changes(&self.root);
+            st.changes = self.host.changes();
         }
     }
 
@@ -301,7 +299,7 @@ impl App {
 
     pub fn reload_tree(&mut self) {
         let selected = self.visible.get(self.sel).map(|v| v.path.clone());
-        self.tree = tree::build(&self.root, &Filter { show_all: self.show_all, assets_dir: &self.cfg.assets_dir });
+        self.tree = tree::build(&*self.fs, &Filter { show_all: self.show_all, assets_dir: &self.cfg.assets_dir });
         self.visible = tree::flatten(&self.tree, &self.expanded);
         match selected.and_then(|p| self.visible.iter().position(|v| v.path == p)) {
             Some(i) => self.sel = i,
@@ -383,23 +381,18 @@ impl App {
     }
 
     fn resolve_folder(&self, path: &Path) -> PathBuf {
-        if self.root.join(path).is_dir() && repo::has_index(&self.root.join(path)) {
-            path.join(INDEX)
-        } else {
-            path.to_path_buf()
-        }
+        if self.fs.is_dir(path) && repo::dir_has_index(&*self.fs, path) { path.join(INDEX) } else { path.to_path_buf() }
     }
 
     pub fn load_page(&mut self, path: PathBuf) {
         let path = self.resolve_folder(&path);
-        let abs = self.root.join(&path);
-        let kind = if abs.is_dir() {
+        let kind = if self.fs.is_dir(&path) {
             PageKind::Folder
         } else if paths::is_image(&path) {
-            self.images.forget(&abs);
+            self.images.forget(&path);
             PageKind::Image
         } else {
-            match fs::read(&abs) {
+            match self.fs.read(&path) {
                 Ok(bytes) if !bytes.contains(&0) => match String::from_utf8(bytes) {
                     Ok(s) if paths::is_markdown(&path) => PageKind::Markdown(markdown::render(&s)),
                     Ok(s) => PageKind::Text(s),
@@ -423,7 +416,7 @@ impl App {
     fn reload_page(&mut self) {
         if let Some(p) = &self.page {
             let path = p.path.clone();
-            if self.root.join(&path).exists() {
+            if self.fs.exists(&path) {
                 self.load_page(path);
             } else {
                 self.page = None;
@@ -437,7 +430,7 @@ impl App {
             return self.error("This file can't be edited here");
         }
         let path = page.path.clone();
-        let content = match fs::read_to_string(self.root.join(&path)) {
+        let content = match self.fs.read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return self.error(e.to_string()),
         };
@@ -453,7 +446,7 @@ impl App {
     fn save(&mut self) -> Result<()> {
         let Some(e) = &mut self.editor else { return Ok(()) };
         let lines = e.ta.lines().to_vec();
-        fs::write(self.root.join(&e.path), lines.join(e.eol))?;
+        self.fs.write(&e.path, lines.join(e.eol).as_bytes())?;
         e.saved = lines;
         self.reload_page();
         self.refresh_changes();
@@ -478,7 +471,7 @@ impl App {
 
     /// Lays out the viewer rows for a pane of the given size.
     pub fn layout(&mut self, width: u16, height: u16) {
-        let App { view, page, images, root, .. } = self;
+        let App { view, page, images, .. } = self;
         view.height = height;
         view.rows.clear();
         let Some(page) = page else { return };
@@ -494,9 +487,9 @@ impl App {
                         Block::Image { dest, .. } => {
                             // Decode lazily: only once the image is near the visible window.
                             let near = view.rows.len() < view.scroll + height as usize + MAX_IMAGE_ROWS as usize;
-                            let fit = links::resolve(&page.path, dest).filter(|_| near && images.enabled()).and_then(
-                                |(t, _)| images.fit(&root.join(t), Size::new(width, MAX_IMAGE_ROWS.min(height))),
-                            );
+                            let fit = links::resolve(&page.path, dest)
+                                .filter(|_| near && images.enabled())
+                                .and_then(|(t, _)| images.fit(&t, Size::new(width, MAX_IMAGE_ROWS.min(height))));
                             match fit {
                                 Some(size) => {
                                     for part in 0..size.height {
@@ -551,38 +544,40 @@ impl App {
         let Some(page) = self.page.as_ref().map(|p| p.path.clone()) else { return };
         if !links::is_local(&dest) {
             if dest.contains("://") || dest.starts_with("mailto:") {
-                self.open_external(Path::new(&dest));
+                self.open_external(Open::Url(&dest));
             }
             return;
         }
         let Some((target, _)) = links::resolve(&page, &dest) else {
             return self.error(format!("Link points outside the repo: {dest}"));
         };
-        let abs = self.root.join(&target);
-        if !abs.exists() {
+        if !self.fs.exists(&target) {
             return self.error(format!("Not found: {}", paths::to_slash(&target)));
         }
-        if abs.is_dir() || paths::is_markdown(&target) {
+        if self.fs.is_dir(&target) || paths::is_markdown(&target) {
             self.reveal(&self.resolve_folder(&target));
             self.request_open(target);
         } else {
-            self.open_external(&abs);
+            self.open_external(Open::File(&target));
         }
     }
 
-    fn open_external(&mut self, target: &Path) {
-        if let Err(e) = open::that_detached(target) {
+    fn open_external(&mut self, target: Open) {
+        if let Err(e) = self.host.open(target) {
             self.error(format!("Could not open: {e}"));
         }
     }
 
     // ---- input ---------------------------------------------------------
 
-    fn action(&self, k: &KeyEvent, candidates: &[Action]) -> Option<Action> {
+    fn action(&self, k: &Input, candidates: &[Action]) -> Option<Action> {
         candidates.iter().copied().find(|&a| self.keys.is(a, k))
     }
 
-    pub fn on_key(&mut self, k: KeyEvent) {
+    pub fn on_key(&mut self, k: Input) {
+        if k.key == Key::Null {
+            return;
+        }
         if !matches!(self.modal, Modal::None) {
             return self.modal_key(k);
         }
@@ -651,7 +646,7 @@ impl App {
         }
     }
 
-    fn edit_key(&mut self, k: KeyEvent) {
+    fn edit_key(&mut self, k: Input) {
         match self.action(&k, EDIT) {
             Some(Action::Save) => match self.save() {
                 Ok(()) => self.info("Saved"),
@@ -733,7 +728,7 @@ impl App {
                 if node.path.as_os_str().is_empty() {
                     return self.error("The root can't be deleted");
                 }
-                let n = links::count_incoming(&self.root, &node.path, &tree::markdown_files(&self.root));
+                let n = links::count_incoming(&*self.fs, &node.path, &tree::markdown_files(&*self.fs));
                 let what = if node.is_dir { "folder and everything in it" } else { "page" };
                 let refs = match n {
                     0 => String::new(),
@@ -744,6 +739,7 @@ impl App {
                 self.modal = Modal::ConfirmDelete { path: node.path, message };
             }
             Action::InsertImage => match self.current_markdown() {
+                Some(page) if self.host.pick_image() => self.pending_image = Some(page),
                 Some(page) => self.prompt("Image file to insert", String::new(), PromptKind::InsertImage(page)),
                 None => self.error("Open a markdown page first"),
             },
@@ -772,15 +768,15 @@ impl App {
                     _ => None,
                 };
                 let Some(page) = self.page.as_ref().map(|p| p.path.clone()) else { return };
-                let target = match image {
-                    Some(dest) if !links::is_local(&dest) => PathBuf::from(dest),
-                    Some(dest) => match links::resolve(&page, &dest) {
-                        Some((t, _)) => self.root.join(t),
-                        None => return,
-                    },
-                    None => self.root.join(&page),
-                };
-                self.open_external(&target);
+                match image {
+                    Some(dest) if !links::is_local(&dest) => self.open_external(Open::Url(&dest)),
+                    Some(dest) => {
+                        if let Some((t, _)) = links::resolve(&page, &dest) {
+                            self.open_external(Open::File(&t));
+                        }
+                    }
+                    None => self.open_external(Open::File(&page)),
+                }
             }
             _ => {}
         }
@@ -794,50 +790,50 @@ impl App {
         self.modal = Modal::Prompt { title: title.into(), input, kind };
     }
 
-    fn modal_key(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    fn modal_key(&mut self, k: Input) {
+        let ctrl = k.ctrl;
         match std::mem::replace(&mut self.modal, Modal::None) {
             Modal::Help => {}
-            Modal::Prompt { title, mut input, kind } => match k.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => {
+            Modal::Prompt { title, mut input, kind } => match k.key {
+                Key::Esc => {}
+                Key::Enter => {
                     if let Err(e) = self.submit(kind, input.trim()) {
                         self.error(e.to_string());
                     }
                 }
-                KeyCode::Backspace => {
+                Key::Backspace => {
                     input.pop();
                     self.modal = Modal::Prompt { title, input, kind };
                 }
-                KeyCode::Char('u') if ctrl => self.modal = Modal::Prompt { title, input: String::new(), kind },
-                KeyCode::Char(c) if !ctrl => {
+                Key::Char('u') if ctrl => self.modal = Modal::Prompt { title, input: String::new(), kind },
+                Key::Char(c) if !ctrl => {
                     input.push(c);
                     self.modal = Modal::Prompt { title, input, kind };
                 }
                 _ => self.modal = Modal::Prompt { title, input, kind },
             },
-            Modal::ConfirmDelete { path, message } => match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+            Modal::ConfirmDelete { path, message } => match k.key {
+                Key::Char('y') | Key::Char('Y') => {
                     if let Err(e) = self.delete(&path) {
                         self.error(e.to_string());
                     }
                 }
-                KeyCode::Char(_) | KeyCode::Esc | KeyCode::Enter => {}
+                Key::Char(_) | Key::Esc | Key::Enter => {}
                 _ => self.modal = Modal::ConfirmDelete { path, message },
             },
-            Modal::SaveChanges(after) => match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => match self.save() {
+            Modal::SaveChanges(after) => match k.key {
+                Key::Char('y') | Key::Char('Y') => match self.save() {
                     Ok(()) => self.after_save_prompt(after),
                     Err(e) => self.error(format!("Save failed: {e}")),
                 },
-                KeyCode::Char('n') | KeyCode::Char('N') => self.after_save_prompt(after),
-                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {}
+                Key::Char('n') | Key::Char('N') => self.after_save_prompt(after),
+                Key::Esc | Key::Char('c') | Key::Char('C') => {}
                 _ => self.modal = Modal::SaveChanges(after),
             },
             Modal::Search { mut query, items, results, mut sel } => {
-                match k.code {
-                    KeyCode::Esc => return,
-                    KeyCode::Enter => {
+                match k.key {
+                    Key::Esc => return,
+                    Key::Enter => {
                         if let Some(&i) = results.get(sel) {
                             let path = items[i].1.clone();
                             self.reveal(&path);
@@ -848,20 +844,18 @@ impl App {
                         }
                         return;
                     }
-                    KeyCode::Up => sel = sel.saturating_sub(1),
-                    KeyCode::Char('p') | KeyCode::Char('k') if ctrl => sel = sel.saturating_sub(1),
-                    KeyCode::Down => sel = (sel + 1).min(results.len().saturating_sub(1)),
-                    KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
-                        sel = (sel + 1).min(results.len().saturating_sub(1))
-                    }
-                    KeyCode::Backspace => {
+                    Key::Up => sel = sel.saturating_sub(1),
+                    Key::Char('p') | Key::Char('k') if ctrl => sel = sel.saturating_sub(1),
+                    Key::Down => sel = (sel + 1).min(results.len().saturating_sub(1)),
+                    Key::Char('n') | Key::Char('j') if ctrl => sel = (sel + 1).min(results.len().saturating_sub(1)),
+                    Key::Backspace => {
                         query.pop();
                     }
-                    KeyCode::Char(c) if !ctrl => query.push(c),
+                    Key::Char(c) if !ctrl => query.push(c),
                     _ => {}
                 }
                 self.modal = Modal::Search { query, items, results, sel };
-                if matches!(k.code, KeyCode::Backspace | KeyCode::Char(_)) && !ctrl {
+                if matches!(k.key, Key::Backspace | Key::Char(_)) && !ctrl {
                     self.search_update();
                 }
             }
@@ -872,7 +866,7 @@ impl App {
     // ---- search --------------------------------------------------------
 
     fn open_search(&mut self) {
-        let items: Vec<(String, PathBuf)> = tree::markdown_files(&self.root)
+        let items: Vec<(String, PathBuf)> = tree::markdown_files(&*self.fs)
             .into_iter()
             .map(|p| {
                 let label = if paths::is_index(&p) {
@@ -914,7 +908,7 @@ impl App {
             }
             PromptKind::NewFolder(dir) => {
                 let folder = dir.join(clean_rel(input)?);
-                if self.root.join(&folder).exists() {
+                if self.fs.exists(&folder) {
                     bail!("'{}' already exists", paths::to_slash(&folder));
                 }
                 let title = folder.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -923,7 +917,7 @@ impl App {
             }
             PromptKind::Rename(old) => {
                 let mut new = clean_rel(input)?;
-                if !self.root.join(&old).is_dir() && paths::is_markdown(&old) && !paths::is_markdown(&new) {
+                if !self.fs.is_dir(&old) && paths::is_markdown(&old) && !paths::is_markdown(&new) {
                     new = PathBuf::from(format!("{}.md", new.to_string_lossy()));
                 }
                 self.move_path(&old, &new)
@@ -933,14 +927,10 @@ impl App {
     }
 
     fn create_and_edit(&mut self, rel: PathBuf, title: &str) -> Result<()> {
-        let abs = self.root.join(&rel);
-        if abs.exists() {
+        if self.fs.exists(&rel) {
             bail!("'{}' already exists", paths::to_slash(&rel));
         }
-        if let Some(dir) = abs.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(&abs, format!("# {title}\n"))?;
+        self.fs.write(&rel, format!("# {title}\n").as_bytes())?;
         self.reload_tree();
         self.reveal(&rel);
         self.request_open(rel);
@@ -964,23 +954,20 @@ impl App {
             bail!("Can't move a folder into itself");
         }
         let case_only = paths::to_slash(new).to_lowercase() == paths::to_slash(old).to_lowercase();
-        if self.root.join(new).exists() && !case_only {
+        if self.fs.exists(new) && !case_only {
             bail!("'{}' already exists", paths::to_slash(new));
         }
         let mut edits = Vec::new();
-        for f in tree::markdown_files(&self.root) {
-            let Ok(src) = fs::read_to_string(self.root.join(&f)) else { continue };
+        for f in tree::markdown_files(&*self.fs) {
+            let Ok(src) = self.fs.read_to_string(&f) else { continue };
             let f_new = links::map_moved(&f, old, new);
             if let Some(out) = links::rewrite(&src, &f, &f_new, old, new) {
                 edits.push((f_new, out));
             }
         }
-        if let Some(dir) = self.root.join(new).parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::rename(self.root.join(old), self.root.join(new))?;
+        self.fs.rename(old, new)?;
         for (f, content) in &edits {
-            fs::write(self.root.join(f), content)?;
+            self.fs.write(f, content.as_bytes())?;
         }
         self.expanded = self.expanded.iter().map(|p| links::map_moved(p, old, new)).collect();
         if let Some(p) = &mut self.page {
@@ -1001,12 +988,7 @@ impl App {
     }
 
     fn delete(&mut self, path: &Path) -> Result<()> {
-        let abs = self.root.join(path);
-        if abs.is_dir() {
-            fs::remove_dir_all(&abs)?
-        } else {
-            fs::remove_file(&abs)?
-        }
+        self.fs.remove(path)?;
         if self.page.as_ref().is_some_and(|p| p.path.starts_with(path)) {
             self.page = None;
             self.editor = None;
@@ -1023,13 +1005,26 @@ impl App {
         if !src.is_file() {
             bail!("Not a file: {}", src.display());
         }
+        let name = src.file_name().ok_or_else(|| anyhow!("Not a file: {}", src.display()))?.to_string_lossy();
+        self.insert_image_bytes(page, &name, &std::fs::read(&src)?)
+    }
+
+    /// Delivers an image picked through [`Host::pick_image`].
+    pub fn insert_image_data(&mut self, name: &str, bytes: &[u8]) {
+        let Some(page) = self.pending_image.take() else { return };
+        if let Err(e) = self.insert_image_bytes(&page, name, bytes) {
+            self.error(e.to_string());
+        }
+    }
+
+    /// Copies an image into the assets dir and links it from `page`.
+    fn insert_image_bytes(&mut self, page: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+        let name = Path::new(name).file_name().ok_or_else(|| anyhow!("Invalid file name: {name}"))?;
         let assets = PathBuf::from(&self.cfg.assets_dir);
-        fs::create_dir_all(self.root.join(&assets))?;
-        let name = src.file_name().ok_or_else(|| anyhow!("Not a file: {}", src.display()))?;
-        let bytes = fs::read(&src)?;
-        let rel = unique_asset(&self.root, &assets, Path::new(name), &bytes);
-        if !self.root.join(&rel).exists() {
-            fs::write(self.root.join(&rel), &bytes)?;
+        self.fs.create_dir_all(&assets)?;
+        let rel = unique_asset(&*self.fs, &assets, Path::new(name), bytes);
+        if !self.fs.exists(&rel) {
+            self.fs.write(&rel, bytes)?;
         }
         let alt = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let md = format!("![{alt}]({})", paths::encode_link(&paths::relative(&paths::parent(page), &rel)));
@@ -1039,14 +1034,13 @@ impl App {
                 self.info("Image inserted (unsaved)");
             }
             _ => {
-                let abs = self.root.join(page);
-                let mut content = fs::read_to_string(&abs)?;
+                let mut content = self.fs.read_to_string(page)?;
                 let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
                 if !content.is_empty() && !content.ends_with('\n') {
                     content.push_str(eol);
                 }
                 content.push_str(&format!("{eol}{md}{eol}"));
-                fs::write(&abs, content)?;
+                self.fs.write(page, content.as_bytes())?;
                 self.reload_page();
                 self.info("Image inserted");
             }
@@ -1086,13 +1080,16 @@ fn expand_user_path(input: &str) -> PathBuf {
 }
 
 /// Picks `assets/<name>`, reusing an identical existing file or adding `-1`, `-2`, … .
-fn unique_asset(root: &Path, assets: &Path, name: &Path, bytes: &[u8]) -> PathBuf {
+fn unique_asset(fs: &dyn Storage, assets: &Path, name: &Path, bytes: &[u8]) -> PathBuf {
     let stem = name.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = name.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     for n in 0.. {
         let candidate = if n == 0 { assets.join(name) } else { assets.join(format!("{stem}-{n}{ext}")) };
-        match fs::read(root.join(&candidate)) {
-            Err(_) => return candidate,
+        if !fs.exists(&candidate) {
+            return candidate;
+        }
+        match fs.read(&candidate) {
+            Err(_) => continue,
             Ok(existing) if existing == bytes => return candidate,
             Ok(_) => continue,
         }

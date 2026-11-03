@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui_textarea::{Input, Key};
 
 use crate::config::Config;
 
@@ -54,102 +54,102 @@ actions! {
     ExitEdit => "exit_edit", "back to view", ["esc"];
 }
 
+/// A key with modifiers. Matched against [`Input`], the backend-agnostic key type
+/// shared by the terminal and web frontends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySpec {
-    pub code: KeyCode,
-    pub mods: KeyModifiers,
+    pub key: Key,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
 }
 
 impl KeySpec {
     pub fn parse(s: &str) -> Result<KeySpec> {
         let s = s.trim();
-        let mut mods = KeyModifiers::NONE;
+        let (mut ctrl, mut alt, mut shift) = (false, false, false);
         let mut rest = s;
         // A bare "+" or a key ending with "++" means the plus key itself.
         loop {
             let lower = rest.to_ascii_lowercase();
             let Some(i) = lower.find('+').filter(|&i| i > 0 && i + 1 < rest.len()) else { break };
             match &lower[..i] {
-                "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
-                "alt" => mods |= KeyModifiers::ALT,
-                "shift" => mods |= KeyModifiers::SHIFT,
+                "ctrl" | "control" => ctrl = true,
+                "alt" => alt = true,
+                "shift" => shift = true,
                 m => bail!("unknown modifier '{m}' in '{s}'"),
             }
             rest = &rest[i + 1..];
         }
-        let code = match rest.to_ascii_lowercase().as_str() {
-            "enter" | "return" => KeyCode::Enter,
-            "esc" | "escape" => KeyCode::Esc,
-            "tab" => KeyCode::Tab,
-            "backtab" => KeyCode::BackTab,
-            "space" => KeyCode::Char(' '),
-            "backspace" => KeyCode::Backspace,
-            "delete" | "del" => KeyCode::Delete,
-            "up" => KeyCode::Up,
-            "down" => KeyCode::Down,
-            "left" => KeyCode::Left,
-            "right" => KeyCode::Right,
-            "home" => KeyCode::Home,
-            "end" => KeyCode::End,
-            "pageup" | "pgup" => KeyCode::PageUp,
-            "pagedown" | "pgdn" => KeyCode::PageDown,
-            f if f.len() > 1 && f.starts_with('f') && f[1..].parse::<u8>().is_ok() => {
-                KeyCode::F(f[1..].parse().unwrap())
+        let key = match rest.to_ascii_lowercase().as_str() {
+            "enter" | "return" => Key::Enter,
+            "esc" | "escape" => Key::Esc,
+            "tab" => Key::Tab,
+            "backtab" => {
+                shift = true;
+                Key::Tab
             }
+            "space" => Key::Char(' '),
+            "backspace" => Key::Backspace,
+            "delete" | "del" => Key::Delete,
+            "up" => Key::Up,
+            "down" => Key::Down,
+            "left" => Key::Left,
+            "right" => Key::Right,
+            "home" => Key::Home,
+            "end" => Key::End,
+            "pageup" | "pgup" => Key::PageUp,
+            "pagedown" | "pgdn" => Key::PageDown,
+            f if f.len() > 1 && f.starts_with('f') && f[1..].parse::<u8>().is_ok() => Key::F(f[1..].parse().unwrap()),
             _ => {
                 let mut chars = rest.chars();
                 match (chars.next(), chars.next()) {
-                    (Some(c), None) => {
-                        // Letters with ctrl are matched case-insensitively by terminals.
-                        if mods.contains(KeyModifiers::CONTROL) {
-                            KeyCode::Char(c.to_ascii_lowercase())
-                        } else {
-                            KeyCode::Char(c)
-                        }
-                    }
+                    // Letters with ctrl are matched case-insensitively by terminals.
+                    (Some(c), None) if ctrl => Key::Char(c.to_ascii_lowercase()),
+                    (Some(c), None) => Key::Char(c),
                     _ => return Err(anyhow!("unknown key '{s}'")),
                 }
             }
         };
-        Ok(KeySpec { code, mods })
+        Ok(KeySpec { key, ctrl, alt, shift })
     }
 
-    pub fn matches(&self, ev: &KeyEvent) -> bool {
-        let relevant = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        match (self.code, ev.code) {
-            (KeyCode::Char(a), KeyCode::Char(b)) => {
-                let b = if ev.modifiers.contains(KeyModifiers::CONTROL) { b.to_ascii_lowercase() } else { b };
+    pub fn matches(&self, ev: &Input) -> bool {
+        match (self.key, ev.key) {
+            (Key::Char(a), Key::Char(b)) => {
+                let b = if ev.ctrl { b.to_ascii_lowercase() } else { b };
                 // Shift is already reflected in the character ('N' vs 'n').
-                a == b && (self.mods & relevant) == (ev.modifiers & relevant)
+                a == b && self.ctrl == ev.ctrl && self.alt == ev.alt
             }
-            (a, b) => a == b && self.mods == ev.modifiers,
+            (a, b) => a == b && self.ctrl == ev.ctrl && self.alt == ev.alt && self.shift == ev.shift,
         }
     }
 
     pub fn label(&self) -> String {
         let mut s = String::new();
-        if self.mods.contains(KeyModifiers::CONTROL) {
+        if self.ctrl {
             s.push_str("Ctrl+");
         }
-        if self.mods.contains(KeyModifiers::ALT) {
+        if self.alt {
             s.push_str("Alt+");
         }
-        if self.mods.contains(KeyModifiers::SHIFT) {
+        if self.shift {
             s.push_str("Shift+");
         }
-        let key = match self.code {
-            KeyCode::Char(' ') => "Space".to_string(),
-            KeyCode::Char(c) if !self.mods.is_empty() => c.to_ascii_uppercase().to_string(),
-            KeyCode::Char(c) => c.to_string(),
-            KeyCode::Enter => "Enter".into(),
-            KeyCode::Esc => "Esc".into(),
-            KeyCode::Tab => "Tab".into(),
-            KeyCode::Up => "↑".into(),
-            KeyCode::Down => "↓".into(),
-            KeyCode::Left => "←".into(),
-            KeyCode::Right => "→".into(),
-            KeyCode::PageUp => "PgUp".into(),
-            KeyCode::PageDown => "PgDn".into(),
+        let key = match self.key {
+            Key::Char(' ') => "Space".to_string(),
+            Key::Char(c) if self.ctrl || self.alt || self.shift => c.to_ascii_uppercase().to_string(),
+            Key::Char(c) => c.to_string(),
+            Key::Enter => "Enter".into(),
+            Key::Esc => "Esc".into(),
+            Key::Tab => "Tab".into(),
+            Key::Up => "↑".into(),
+            Key::Down => "↓".into(),
+            Key::Left => "←".into(),
+            Key::Right => "→".into(),
+            Key::PageUp => "PgUp".into(),
+            Key::PageDown => "PgDn".into(),
+            Key::F(n) => format!("F{n}"),
             other => format!("{other:?}"),
         };
         s.push_str(&key);
@@ -189,7 +189,7 @@ impl Keymap {
         (Keymap { map }, warnings)
     }
 
-    pub fn is(&self, action: Action, ev: &KeyEvent) -> bool {
+    pub fn is(&self, action: Action, ev: &Input) -> bool {
         self.map.get(&action).is_some_and(|keys| keys.iter().any(|k| k.matches(ev)))
     }
 
@@ -211,21 +211,21 @@ impl Default for Keymap {
 mod tests {
     use super::*;
 
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
+    fn key(key: Key, ctrl: bool, shift: bool) -> Input {
+        Input { key, ctrl, alt: false, shift }
     }
 
     #[test]
     fn parses_and_matches() {
         let k = KeySpec::parse("ctrl+g").unwrap();
-        assert!(k.matches(&key(KeyCode::Char('g'), KeyModifiers::CONTROL)));
-        assert!(!k.matches(&key(KeyCode::Char('g'), KeyModifiers::NONE)));
+        assert!(k.matches(&key(Key::Char('g'), true, false)));
+        assert!(!k.matches(&key(Key::Char('g'), false, false)));
 
         let n = KeySpec::parse("N").unwrap();
-        assert!(n.matches(&key(KeyCode::Char('N'), KeyModifiers::SHIFT)));
-        assert!(!n.matches(&key(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(n.matches(&key(Key::Char('N'), false, true)));
+        assert!(!n.matches(&key(Key::Char('n'), false, false)));
 
-        assert_eq!(KeySpec::parse("pgdn").unwrap().code, KeyCode::PageDown);
+        assert_eq!(KeySpec::parse("pgdn").unwrap().key, Key::PageDown);
         assert!(KeySpec::parse("hyper+x").is_err());
     }
 
@@ -233,8 +233,8 @@ mod tests {
     fn config_overrides_defaults() {
         let cfg: Config = toml::from_str("[keys]\nquit = \"ctrl+q\"\nbogus = \"x\"").unwrap();
         let (km, warnings) = Keymap::from_config(&cfg);
-        assert!(km.is(Action::Quit, &key(KeyCode::Char('q'), KeyModifiers::CONTROL)));
-        assert!(!km.is(Action::Quit, &key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(km.is(Action::Quit, &key(Key::Char('q'), true, false)));
+        assert!(!km.is(Action::Quit, &key(Key::Char('q'), false, false)));
         assert_eq!(warnings.len(), 1);
         assert_eq!(km.label(Action::Down), "↓ / j");
     }

@@ -53,7 +53,10 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)?;
-        toml::from_str(&text).with_context(|| format!("invalid {FILE_NAME}"))
+        Self::parse(&std::fs::read_to_string(&path)?)
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        toml::from_str(text).with_context(|| format!("invalid {FILE_NAME}"))
     }
 }

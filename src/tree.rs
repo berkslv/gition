@@ -1,11 +1,11 @@
 //! The page tree shown on the left.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::paths;
 use crate::repo::INDEX;
+use crate::storage::Storage;
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -49,18 +49,16 @@ impl Filter<'_> {
     }
 }
 
-pub fn build(root: &Path, filter: &Filter) -> Node {
-    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
-    Node { path: PathBuf::new(), name, is_dir: true, children: children(root, Path::new(""), filter) }
+pub fn build(fs: &dyn Storage, filter: &Filter) -> Node {
+    Node { path: PathBuf::new(), name: fs.name(), is_dir: true, children: children(fs, Path::new(""), filter) }
 }
 
-fn children(root: &Path, rel: &Path, filter: &Filter) -> Vec<Node> {
-    let Ok(rd) = fs::read_dir(root.join(rel)) else { return Vec::new() };
-    let mut nodes: Vec<Node> = rd
-        .flatten()
+fn children(fs: &dyn Storage, rel: &Path, filter: &Filter) -> Vec<Node> {
+    let Ok(entries) = fs.read_dir(rel) else { return Vec::new() };
+    let mut nodes: Vec<Node> = entries
+        .into_iter()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e.file_type().ok()?.is_dir();
+            let (name, is_dir) = (e.name, e.is_dir);
             let child = rel.join(&name);
             if !filter.keep(&child, &name, is_dir) {
                 return None;
@@ -70,7 +68,7 @@ fn children(root: &Path, rel: &Path, filter: &Filter) -> Vec<Node> {
             } else {
                 name
             };
-            let kids = if is_dir { children(root, &child, filter) } else { Vec::new() };
+            let kids = if is_dir { children(fs, &child, filter) } else { Vec::new() };
             Some(Node { path: child, name: label, is_dir, children: kids })
         })
         .collect();
@@ -95,25 +93,24 @@ pub fn flatten(root: &Node, expanded: &HashSet<PathBuf>) -> Vec<Visible> {
     out
 }
 
-/// All markdown files under `root`, skipping dot-directories.
-pub fn markdown_files(root: &Path) -> Vec<PathBuf> {
-    fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = fs::read_dir(root.join(rel)) else { return };
-        for e in rd.flatten() {
-            let name = e.file_name();
-            if name.to_string_lossy().starts_with('.') {
+/// All markdown files, skipping dot-directories.
+pub fn markdown_files(fs: &dyn Storage) -> Vec<PathBuf> {
+    fn walk(fs: &dyn Storage, rel: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs.read_dir(rel) else { return };
+        for e in entries {
+            if e.name.starts_with('.') {
                 continue;
             }
-            let child = rel.join(&name);
-            match e.file_type() {
-                Ok(t) if t.is_dir() => walk(root, &child, out),
-                Ok(_) if paths::is_markdown(&child) => out.push(child),
-                _ => {}
+            let child = rel.join(&e.name);
+            if e.is_dir {
+                walk(fs, &child, out);
+            } else if paths::is_markdown(&child) {
+                out.push(child);
             }
         }
     }
     let mut out = Vec::new();
-    walk(root, Path::new(""), &mut out);
+    walk(fs, Path::new(""), &mut out);
     out.sort();
     out
 }
@@ -121,6 +118,8 @@ pub fn markdown_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::FsStorage;
+    use std::fs;
 
     #[test]
     fn builds_filtered_tree() {
@@ -140,16 +139,17 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, "x").unwrap();
         }
-        let tree = build(root, &Filter { show_all: false, assets_dir: "assets" });
+        let store = FsStorage::new(root.to_path_buf());
+        let tree = build(&store, &Filter { show_all: false, assets_dir: "assets" });
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("Projects"));
         let names: Vec<_> = flatten(&tree, &expanded).into_iter().skip(1).map(|v| (v.name, v.depth)).collect();
         assert_eq!(names, [("Projects".into(), 1), ("plan".into(), 2), ("A".into(), 1), ("b".into(), 1)]);
 
-        let all = build(root, &Filter { show_all: true, assets_dir: "assets" });
+        let all = build(&store, &Filter { show_all: true, assets_dir: "assets" });
         let names: Vec<_> = all.children.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, [".hidden", "assets", "Projects", "A.md", "b.md", "INDEX.md", "notes.txt"]);
 
-        assert_eq!(markdown_files(root).len(), 5);
+        assert_eq!(markdown_files(&store).len(), 5);
     }
 }

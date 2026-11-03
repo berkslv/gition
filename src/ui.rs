@@ -1,18 +1,18 @@
 //! Drawing.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect, Size};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame_, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Modal, PageKind, Row};
-use crate::git::Remote;
 use crate::keymap::Action;
 use crate::links;
 use crate::markdown::Block;
 use crate::paths;
+use crate::sync::Remote;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -111,30 +111,38 @@ fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
             notice(f, format!("Binary file. Press {} to open it externally.", app.keys.label(Action::OpenExternal)))
         }
         PageKind::Image => {
-            let abs = app.root.join(&page.path);
-            let size = app.images.fit(&abs, Size::new(inner.width, inner.height));
-            match size.and_then(|s| app.images.protocol(&abs, s).map(|p| (s, p))) {
-                Some((s, proto)) => {
-                    let rect = Rect::new(inner.x, inner.y, s.width, s.height);
-                    f.render_widget(ratatui_image::Image::new(proto), rect);
-                }
-                None => notice(
-                    f,
-                    format!(
-                        "🖼 {} (press {} to open)",
-                        paths::to_slash(&page.path),
-                        app.keys.label(Action::OpenExternal)
-                    ),
-                ),
+            let path = page.path.clone();
+            if !draw_image(f, app, &path, inner) {
+                let label = app.keys.label(Action::OpenExternal);
+                notice(f, format!("🖼 {} (press {label} to open)", paths::to_slash(&path)));
             }
         }
         PageKind::Markdown(_) | PageKind::Text(_) => draw_rows(f, app, inner, focused),
     }
 }
 
+/// Draws an image fitted into `area`; false if it can't be shown.
+#[cfg(feature = "native")]
+fn draw_image(f: &mut Frame, app: &mut App, path: &std::path::Path, area: Rect) -> bool {
+    let size = app.images.fit(path, ratatui::layout::Size::new(area.width, area.height));
+    match size.and_then(|s| app.images.protocol(path, s).map(|p| (s, p))) {
+        Some((s, proto)) => {
+            f.render_widget(ratatui_image::Image::new(proto), Rect::new(area.x, area.y, s.width, s.height));
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(not(feature = "native"))]
+fn draw_image(_f: &mut Frame, _app: &mut App, _path: &std::path::Path, _area: Rect) -> bool {
+    false
+}
+
 fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     app.layout(inner.width, inner.height);
-    let App { view, images, page, root, .. } = app;
+    #[cfg_attr(not(feature = "native"), allow(unused_variables))]
+    let App { view, images, page, .. } = app;
     let Some(page) = page else { return };
     let blocks: &[Block] = match &page.kind {
         PageKind::Markdown(b) => b,
@@ -168,10 +176,13 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
                         _ => continue,
                     };
                     let Some((target, _)) = links::resolve(&page.path, dest) else { continue };
-                    if let Some(proto) = images.protocol(&root.join(target), *size) {
+                    #[cfg(feature = "native")]
+                    if let Some(proto) = images.protocol(&target, *size) {
                         let r = Rect::new(inner.x, y, size.width, size.height);
                         f.render_widget(ratatui_image::Image::new(proto), r);
                     }
+                    #[cfg(not(feature = "native"))]
+                    let _ = target;
                 } else if *part == 0 || i == view.scroll {
                     // Partly scrolled out: graphics protocols can't clip, show a label instead.
                     f.render_widget(placeholder(*block), rect);

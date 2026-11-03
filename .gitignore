@@ -1,2 +1,8 @@
 /target
 *.snap.new
+/web/target
+/web/client/dist
+/web/server/build
+/web/.wrangler
+/web/.dev.vars
+node_modules
