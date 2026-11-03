@@ -34,6 +34,11 @@
         flex: 1;
         min-height: 0;
         overflow: hidden;
+        /* Taps, drags and long presses are gestures for gition, not page scrolling or text selection. */
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-touch-callout: none;
       }
       /* Ratzilla draws each row as a <pre>; drop the browser's margins so rows touch. */
       pre {
@@ -54,37 +59,6 @@
         font-size: 16px;
         resize: none;
       }
-      /* Keys a phone keyboard doesn't have. Only on touch screens. */
-      #bar {
-        display: none;
-        gap: 3px;
-        padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
-        background: #1a1d24;
-        border-top: 1px solid #2e3440;
-        -webkit-user-select: none;
-        user-select: none;
-      }
-      #bar button {
-        flex: 1 1 0;
-        min-width: 0;
-        height: 40px;
-        padding: 0;
-        border: 0;
-        border-radius: 6px;
-        background: #2e3440;
-        color: #d8dee9;
-        font: inherit;
-        font-size: 13px;
-        touch-action: manipulation;
-      }
-      #bar button:active {
-        background: #4c566a;
-      }
-      @media (hover: none) and (pointer: coarse) {
-        #bar {
-          display: flex;
-        }
-      }
       @media (max-width: 600px) {
         html,
         body {
@@ -95,20 +69,6 @@
   </head>
   <body>
     <div id="term"></div>
-    <div id="bar">
-      <button data-key="kbd" aria-label="Keyboard">⌨</button>
-      <button data-key="esc">Esc</button>
-      <button data-key="tab">Tab</button>
-      <button data-key="up" aria-label="Up">↑</button>
-      <button data-key="down" aria-label="Down">↓</button>
-      <button data-key="left" aria-label="Left">←</button>
-      <button data-key="right" aria-label="Right">→</button>
-      <button data-key="enter" aria-label="Enter">⏎</button>
-      <button data-key="ctrl+s">Save</button>
-      <button data-key="ctrl+g">Sync</button>
-      <button data-key="ctrl+b">Tree</button>
-      <button data-key="?">?</button>
-    </div>
     <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
   </body>
 </html>

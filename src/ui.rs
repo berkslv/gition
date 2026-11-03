@@ -12,6 +12,7 @@ use crate::keymap::Action;
 use crate::links;
 use crate::markdown::Block;
 use crate::paths;
+use crate::pointer::{self, Target};
 use crate::sync::Remote;
 
 const ACCENT: Color = Color::Cyan;
@@ -21,6 +22,7 @@ const CURSOR_BG: Color = Color::Indexed(236);
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.width = area.width;
+    app.hits.clear();
     let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     let tree_w = if app.tree_visible() { app.cfg.tree_width.min(main.width / 2) } else { 0 };
     let [tree_area, page_area] = Layout::horizontal([Constraint::Length(tree_w), Constraint::Fill(1)]).areas(main);
@@ -29,7 +31,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_page(f, app, page_area);
     draw_status(f, app, status);
-    draw_modal(f, app, area);
+    app.hits.push((status, Target::Status));
+    let hits = draw_modal(f, app, area);
+    app.hits.extend(hits);
 }
 
 fn pane(title: String, focused: bool) -> Frame_<'static> {
@@ -64,9 +68,15 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let highlight = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new().bg(CURSOR_BG) };
-    let list = List::new(items).block(pane(" Pages ".into(), focused)).highlight_style(highlight);
+    let block = pane(" Pages ".into(), focused);
+    let inner = block.inner(area);
+    let list = List::new(items).block(block).highlight_style(highlight);
     app.tree_state.select(Some(app.sel));
     f.render_stateful_widget(list, area, &mut app.tree_state);
+    let offset = app.tree_state.offset();
+    for (i, y) in (offset..app.visible.len()).zip(inner.y..inner.bottom()) {
+        app.hits.push((Rect::new(inner.x, y, inner.width, 1), Target::TreeRow(i)));
+    }
 }
 
 fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
@@ -82,11 +92,13 @@ fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.hits.push((area, Target::Page));
 
     if editing {
         if let Some(e) = &app.editor {
             f.render_widget(&e.ta, inner);
         }
+        app.hits.push((inner, Target::Editor(inner)));
         return;
     }
     let notice = |f: &mut Frame, text: String| {
@@ -142,7 +154,7 @@ fn draw_image(_f: &mut Frame, _app: &mut App, _path: &std::path::Path, _area: Re
 fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     app.layout(inner.width, inner.height);
     #[cfg_attr(not(feature = "native"), allow(unused_variables))]
-    let App { view, images, page, .. } = app;
+    let App { view, images, page, hits, .. } = app;
     let Some(page) = page else { return };
     let blocks: &[Block] = match &page.kind {
         PageKind::Markdown(b) => b,
@@ -151,6 +163,7 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     let end = (view.scroll + inner.height as usize).min(view.rows.len());
     for (i, y) in (view.scroll..end).zip(inner.y..) {
         let rect = Rect::new(inner.x, y, inner.width, 1);
+        hits.push((rect, Target::PageRow(i)));
         let is_cursor = focused && i == view.cursor;
         let highlight = if is_cursor { Style::new().bg(CURSOR_BG) } else { Style::new() };
         let placeholder = |block: usize| {
@@ -215,9 +228,12 @@ fn status_text(app: &App) -> (String, Style) {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    // On touch screens the status bar opens the menu, so it always says so.
+    let menu = if app.touch { " ☰" } else { "" };
     let left = match &app.message {
-        Some((m, true, _)) => Span::styled(format!(" {m}"), Style::new().fg(Color::Red)),
-        Some((m, false, _)) => Span::styled(format!(" {m}"), Style::new().fg(Color::Green)),
+        Some((m, true, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(Color::Red)),
+        Some((m, false, _)) => Span::styled(format!("{menu} {m}"), Style::new().fg(Color::Green)),
+        None if app.touch => Span::styled(" ☰ Menu", DIM),
         None => Span::styled(format!(" {} for help", app.keys.label(Action::Help)), DIM),
     };
     let (right, style) = status_text(app);
@@ -233,8 +249,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 3, w, h)
 }
 
-fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
+/// Draws the open modal; returns what it drew where.
+fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
     let hint = |s: &str| Line::styled(s.to_string(), DIM);
+    let mut hits = Vec::new();
     match &app.modal {
         Modal::None => {}
         Modal::Prompt { title, input, .. } => {
@@ -248,12 +266,15 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 Line::raw(""),
                 hint("Enter confirm · Esc cancel"),
             ];
-            popup(f, r, title, lines);
+            hint_hits(&mut hits, r, 2, "Enter confirm · Esc cancel");
+            popup(f, &mut hits, r, title, lines);
         }
         Modal::ConfirmDelete { message, .. } => {
             let r = centered(area, 64, 5);
+            hint_hits(&mut hits, r, 2, "y delete · any other key cancel");
             popup(
                 f,
+                &mut hits,
                 r,
                 "Delete",
                 vec![Line::raw(message.clone()), Line::raw(""), hint("y delete · any other key cancel")],
@@ -261,8 +282,10 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
         }
         Modal::SaveChanges(_) => {
             let r = centered(area, 48, 5);
+            hint_hits(&mut hits, r, 2, "y save · n discard · Esc cancel");
             popup(
                 f,
+                &mut hits,
                 r,
                 "Unsaved changes",
                 vec![Line::raw("Save changes?"), Line::raw(""), hint("y save · n discard · Esc cancel")],
@@ -280,9 +303,11 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
             lines.push(hint(&format!("{} of {}", results.len(), items.len())));
             for (n, &i) in results.iter().enumerate().skip(start).take(max) {
                 let style = if n == *sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                let y = r.y + 1 + lines.len() as u16;
+                hits.push((Rect::new(r.x + 1, y, r.width.saturating_sub(2), 1), Target::SearchResult(n)));
                 lines.push(Line::styled(format!(" {} ", items[i].0), style));
             }
-            popup(f, r, "Find page", lines);
+            popup(f, &mut hits, r, "Find page", lines);
         }
         Modal::Help => {
             let sections: [(&str, &[Action]); 4] = [
@@ -327,12 +352,48 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
             }
             lines.push(hint("Keys are configurable in .gition.toml · any key closes"));
             let r = centered(area, 66, lines.len() as u16 + 2);
-            popup(f, r, "Keys", lines);
+            popup(f, &mut hits, r, "Keys", lines);
         }
+        Modal::Menu { items, sel } => {
+            let r = centered(area, 40, items.len() as u16 + 2);
+            let inner = r.width.saturating_sub(2) as usize;
+            let mut lines = Vec::new();
+            for (n, &a) in items.iter().enumerate() {
+                let label = pointer::menu_label(a);
+                let key = app.keys.label(a);
+                let pad = inner.saturating_sub(label.width() + key.width() + 2);
+                let style = if n == *sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                lines.push(
+                    Line::from(vec![
+                        Span::raw(format!(" {label}{} ", " ".repeat(pad))),
+                        Span::styled(key, DIM),
+                        Span::raw(" "),
+                    ])
+                    .style(style),
+                );
+                hits.push((Rect::new(r.x + 1, r.y + 1 + n as u16, inner as u16, 1), Target::MenuItem(n)));
+            }
+            popup(f, &mut hits, r, "Menu", lines);
+        }
+    }
+    hits
+}
+
+/// Makes each segment of a hint line like "y save · n discard" press its key.
+fn hint_hits(hits: &mut Vec<(Rect, Target)>, popup: Rect, line: u16, text: &str) {
+    let mut x = popup.x + 1;
+    for seg in text.split(" · ") {
+        let w = seg.width() as u16;
+        if let Some(k) = pointer::hint_key(seg) {
+            hits.push((Rect::new(x, popup.y + 1 + line, w, 1), Target::Key(k)));
+        }
+        x += w + 3;
     }
 }
 
-fn popup(f: &mut Frame, r: Rect, title: &str, lines: Vec<Line>) {
+fn popup(f: &mut Frame, hits: &mut Vec<(Rect, Target)>, r: Rect, title: &str, lines: Vec<Line>) {
+    // Under the finer targets: taps on the rest of the modal don't reach the panes.
+    hits.insert(0, (r, Target::Modal));
     f.render_widget(Clear, r);
     let block = Frame_::bordered().title(format!(" {title} ")).border_style(Style::new().fg(ACCENT));
     f.render_widget(Paragraph::new(lines).block(block), r);

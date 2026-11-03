@@ -28,11 +28,12 @@ On the tag, `.github/workflows/ci.yml` checks that the tag matches the version, 
 - `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy.
 - `host.rs`: the `Host` trait (fetch, sync, open externally, file picker). `GitHost` is the git CLI. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
 - `ui.rs`: drawing only. Must not mutate files.
+- `pointer.rs`: touch and mouse. `ui.rs` records what it drew where (`App::hits`); taps, long presses, scrolls and swipes run the same actions as keys. The touch menu lists actions; it has no key of its own.
 - `markdown.rs`: pulldown-cmark to styled `Block`s, plus `wrap`.
 - `links.rs`: finding and rewriting inline links. Used by rename/move and the delete warning.
 - `git.rs`: shells out to the `git` CLI. Don't use `git2`/`gix`.
 - `tree.rs`, `paths.rs`, `repo.rs`, `config.rs`, `keymap.rs`, `images.rs`.
-- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and `main.rs` handles sign-in, the repo picker and keyboard input.
+- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones.
 - `web/server`: the Worker. It only handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie.
 
 ## Rules

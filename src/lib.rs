@@ -8,6 +8,7 @@ pub mod keymap;
 pub mod links;
 pub mod markdown;
 pub mod paths;
+pub mod pointer;
 pub mod repo;
 pub mod storage;
 pub mod sync;

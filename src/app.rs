@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
-use ratatui::layout::Size;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
@@ -22,6 +22,7 @@ use crate::keymap::{Action, Keymap};
 use crate::links;
 use crate::markdown::{self, Block};
 use crate::paths;
+use crate::pointer::Target;
 use crate::repo::{self, INDEX};
 use crate::storage::Storage;
 use crate::sync::State;
@@ -103,11 +104,28 @@ pub enum After {
 
 pub enum Modal {
     None,
-    Prompt { title: String, input: String, kind: PromptKind },
-    ConfirmDelete { path: PathBuf, message: String },
+    Prompt {
+        title: String,
+        input: String,
+        kind: PromptKind,
+    },
+    ConfirmDelete {
+        path: PathBuf,
+        message: String,
+    },
     SaveChanges(After),
-    Search { query: String, items: Vec<(String, PathBuf)>, results: Vec<usize>, sel: usize },
+    Search {
+        query: String,
+        items: Vec<(String, PathBuf)>,
+        results: Vec<usize>,
+        sel: usize,
+    },
     Help,
+    /// Actions to pick by touch (see `pointer`).
+    Menu {
+        items: Vec<Action>,
+        sel: usize,
+    },
 }
 
 pub struct App {
@@ -136,6 +154,10 @@ pub struct App {
     tree_narrow: bool,
     pub width: u16,
     pub quit: bool,
+    /// What the last frame drew where, for pointer input.
+    pub hits: Vec<(Rect, Target)>,
+    /// A touch screen: the status bar offers the menu instead of help.
+    pub touch: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -215,6 +237,8 @@ impl App {
             tree_narrow: false,
             width: 80,
             quit: false,
+            hits: Vec::new(),
+            touch: false,
             tx,
             rx,
         };
@@ -327,11 +351,15 @@ impl App {
     }
 
     pub fn tree_visible(&self) -> bool {
-        if self.width < NARROW_WIDTH { self.tree_narrow } else { self.tree_wide }
+        if self.narrow() { self.tree_narrow } else { self.tree_wide }
     }
 
-    fn toggle_tree(&mut self) {
-        if self.width < NARROW_WIDTH {
+    pub(crate) fn narrow(&self) -> bool {
+        self.width < NARROW_WIDTH
+    }
+
+    pub(crate) fn toggle_tree(&mut self) {
+        if self.narrow() {
             self.tree_narrow = !self.tree_narrow;
         } else {
             self.tree_wide = !self.tree_wide;
@@ -618,7 +646,7 @@ impl App {
         }
     }
 
-    fn global(&mut self, a: Action) {
+    pub(crate) fn global(&mut self, a: Action) {
         match a {
             Action::Quit => {
                 if self.editor.as_ref().is_some_and(Editor::dirty) {
@@ -648,24 +676,7 @@ impl App {
 
     fn edit_key(&mut self, k: Input) {
         match self.action(&k, EDIT) {
-            Some(Action::Save) => match self.save() {
-                Ok(()) => self.info("Saved"),
-                Err(e) => self.error(format!("Save failed: {e}")),
-            },
-            Some(Action::Undo) => {
-                self.editor.as_mut().map(|e| e.ta.undo());
-            }
-            Some(Action::Redo) => {
-                self.editor.as_mut().map(|e| e.ta.redo());
-            }
-            Some(Action::ExitEdit) => {
-                if self.editor.as_ref().is_some_and(Editor::dirty) {
-                    self.modal = Modal::SaveChanges(After::ExitEdit);
-                } else {
-                    self.after_save_prompt(After::ExitEdit);
-                }
-            }
-            Some(a) => self.global(a),
+            Some(a) => self.edit_action(a),
             None => {
                 if let Some(e) = &mut self.editor {
                     e.ta.input(k);
@@ -674,7 +685,30 @@ impl App {
         }
     }
 
-    fn tree_action(&mut self, a: Action) {
+    pub(crate) fn edit_action(&mut self, a: Action) {
+        match a {
+            Action::Save => match self.save() {
+                Ok(()) => self.info("Saved"),
+                Err(e) => self.error(format!("Save failed: {e}")),
+            },
+            Action::Undo => {
+                self.editor.as_mut().map(|e| e.ta.undo());
+            }
+            Action::Redo => {
+                self.editor.as_mut().map(|e| e.ta.redo());
+            }
+            Action::ExitEdit => {
+                if self.editor.as_ref().is_some_and(Editor::dirty) {
+                    self.modal = Modal::SaveChanges(After::ExitEdit);
+                } else {
+                    self.after_save_prompt(After::ExitEdit);
+                }
+            }
+            a => self.global(a),
+        }
+    }
+
+    pub(crate) fn tree_action(&mut self, a: Action) {
         let Some(node) = self.selected().cloned() else { return };
         match a {
             Action::Up => self.sel = self.sel.saturating_sub(1),
@@ -752,7 +786,7 @@ impl App {
         }
     }
 
-    fn view_action(&mut self, a: Action) {
+    pub(crate) fn view_action(&mut self, a: Action) {
         let page = self.view.height.max(2) as isize - 1;
         match a {
             Action::Up => self.move_cursor(-1),
@@ -782,7 +816,7 @@ impl App {
         }
     }
 
-    fn modal_is_none(&self) -> bool {
+    pub(crate) fn modal_is_none(&self) -> bool {
         matches!(self.modal, Modal::None)
     }
 
@@ -794,6 +828,20 @@ impl App {
         let ctrl = k.ctrl;
         match std::mem::replace(&mut self.modal, Modal::None) {
             Modal::Help => {}
+            Modal::Menu { items, mut sel } => match k.key {
+                Key::Enter => {
+                    if let Some(&a) = items.get(sel) {
+                        self.run_action(a);
+                    }
+                }
+                Key::Esc => {}
+                Key::Up | Key::Char('k') => self.modal = Modal::Menu { sel: sel.saturating_sub(1), items },
+                Key::Down | Key::Char('j') => {
+                    sel = (sel + 1).min(items.len().saturating_sub(1));
+                    self.modal = Modal::Menu { items, sel };
+                }
+                _ => self.modal = Modal::Menu { items, sel },
+            },
             Modal::Prompt { title, mut input, kind } => match k.key {
                 Key::Esc => {}
                 Key::Enter => {

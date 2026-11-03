@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use gition::app::App;
 use gition::config::{Config, FILE_NAME};
 use gition::images::Images;
-use gition::keymap::{Action, KeySpec};
+use gition::keymap::Action;
 use gition::repo;
 use gition::storage::Storage;
 use ratatui_textarea::{Input, Key};
@@ -29,7 +29,10 @@ use ratzilla::ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BeforeUnloadEvent, ClipboardEvent, Event, HtmlElement, HtmlTextAreaElement, InputEvent, KeyboardEvent};
+use web_sys::{
+    BeforeUnloadEvent, ClipboardEvent, Event, HtmlElement, HtmlTextAreaElement, InputEvent, KeyboardEvent, MouseEvent,
+    PointerEvent, WheelEvent,
+};
 
 use crate::github::{Api, Session, status};
 use crate::workspace::{Ctx, WebHost, get_item, set_item};
@@ -187,6 +190,7 @@ fn start_app(screen: &Shared, ctx: Rc<Ctx>) {
     if let Some(w) = warning {
         app.error(w);
     }
+    app.touch = touch();
     app.start_fetch();
     set(screen, Screen::App(Box::new(app), ctx));
 }
@@ -249,6 +253,7 @@ fn on_key(screen: &Shared, e: &KeyboardEvent) {
         && handle(screen, input)
     {
         e.prevent_default();
+        fit_keyboard(screen);
     }
 }
 
@@ -415,78 +420,270 @@ fn element<T: JsCast>(id: &str) -> Option<T> {
     window().document()?.get_element_by_id(id)?.dyn_into().ok()
 }
 
-/// Phones: the key bar, the on-screen keyboard and the visual viewport.
+/// The pointer under a finger or mouse, from press to release.
+#[derive(Default)]
+struct Press {
+    id: i32,
+    touch: bool,
+    x: f64,
+    y: f64,
+    /// Where the last whole row of scrolling was taken, in pixels.
+    scrolled_y: f64,
+    moved: bool,
+    /// A long press already opened the menu.
+    held: bool,
+    timer: Option<i32>,
+}
+
+#[derive(Default)]
+struct Gestures {
+    press: Option<Press>,
+    /// Time and cell of the last tap, to notice a double tap.
+    last_tap: Option<(f64, u16, u16)>,
+}
+
+const MOVE_SLOP: f64 = 10.0;
+const LONG_PRESS_MS: i32 = 500;
+const DOUBLE_TAP_MS: f64 = 350.0;
+const SWIPE_MIN: f64 = 60.0;
+
+/// The grid cell under a point, and the height of a cell in pixels.
+fn cell_at(x: f64, y: f64) -> Option<(u16, u16, f64)> {
+    let grid = window().document()?.get_element_by_id(Grid::ID)?;
+    let rows = grid.child_element_count();
+    let cols = grid.first_element_child()?.child_element_count();
+    let r = grid.get_bounding_client_rect();
+    if rows == 0 || cols == 0 || r.width() <= 0.0 {
+        return None;
+    }
+    let (cw, ch) = (r.width() / cols as f64, r.height() / rows as f64);
+    let col = ((x - r.left()) / cw).floor().clamp(0.0, cols as f64 - 1.0) as u16;
+    let row = ((y - r.top()) / ch).floor().clamp(0.0, rows as f64 - 1.0) as u16;
+    Some((col, row, ch))
+}
+
+/// A tap on a screen before the app: sign in, pick a repo, or press a hint's key.
+fn tap_screen(screen: &Shared, col: u16, row: u16) {
+    let p = Position::new(col, row);
+    let Some(tap) = TAPS.with(|t| t.borrow().iter().rev().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone())) else {
+        return;
+    };
+    match tap {
+        Tap::Key(k) => {
+            handle(screen, k);
+        }
+        Tap::Repo(i) => {
+            if let Screen::Repos { sel, .. } = &mut *screen.borrow_mut() {
+                *sel = i;
+            }
+            handle(screen, Input { key: Key::Enter, ..Input::default() });
+        }
+    }
+}
+
+/// Runs `f` on the app if it's open; otherwise lets the screen take a tap.
+fn with_app(screen: &Shared, f: impl FnOnce(&mut App)) -> bool {
+    match &mut *screen.borrow_mut() {
+        Screen::App(app, _) => {
+            f(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Phones: shows the on-screen keyboard while there's something to type into, and hides it
+/// otherwise. Runs inside the touch or key handler, as iOS only opens it from one.
+fn fit_keyboard(screen: &Shared) {
+    if !touch() {
+        return;
+    }
+    let Some(kbd) = element::<HtmlTextAreaElement>("kbd") else { return };
+    let wants = matches!(&*screen.borrow(), Screen::App(app, _) if app.wants_text());
+    let focused = window().document().and_then(|d| d.active_element()).is_some_and(|f| f.is_same_node(Some(&kbd)));
+    if wants && !focused {
+        let _ = kbd.focus();
+    } else if !wants && focused {
+        let _ = kbd.blur();
+    }
+}
+
+/// Touch and mouse: tap, double tap, long press, drag to scroll and swipe for the tree,
+/// plus the mouse wheel. The on-screen keyboard and the visual viewport on phones.
 fn listen_touch(screen: &Shared) {
     let w = window();
-    let Some(kbd) = element::<HtmlTextAreaElement>("kbd") else { return };
+    let Some(term) = element::<HtmlElement>("term") else { return };
+    let gestures: Rc<RefCell<Gestures>> = Rc::default();
 
-    // The bar sends keys a phone keyboard doesn't have; ⌨ shows or hides the keyboard.
-    // Cancelling mousedown keeps the focus, and so the keyboard, where it is; the click still comes.
-    if let Some(bar) = element::<HtmlElement>("bar") {
-        let keep_focus = Closure::<dyn FnMut(Event)>::new(|e: Event| e.prevent_default());
-        let _ = bar.add_event_listener_with_callback("mousedown", keep_focus.as_ref().unchecked_ref());
-        keep_focus.forget();
-        let s = screen.clone();
-        let k = kbd.clone();
-        let click = Closure::<dyn FnMut(Event)>::new(move |e: Event| {
-            let Some(key) = e
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-                .and_then(|t| t.closest("[data-key]").ok().flatten())
-                .and_then(|t| t.get_attribute("data-key"))
-            else {
-                return;
-            };
-            if key == "kbd" {
-                let focused = window().document().and_then(|d| d.active_element());
-                if focused.is_some_and(|f| f.is_same_node(Some(&k))) {
-                    let _ = k.blur();
-                } else {
-                    let _ = k.focus();
+    let s = screen.clone();
+    let g = gestures.clone();
+    let down = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        if e.button() != 0 {
+            return;
+        }
+        // Keeps the focus (and so the keyboard) where it is; taps are handled on release.
+        e.prevent_default();
+        let touch = e.pointer_type() != "mouse";
+        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
+        let mut press = Press { id: e.pointer_id(), touch, x, y, scrolled_y: y, ..Press::default() };
+        if touch {
+            let s = s.clone();
+            let g2 = g.clone();
+            let hold = Closure::once_into_js(move || {
+                let mut gs = g2.borrow_mut();
+                let Some(p) = gs.press.as_mut().filter(|p| !p.moved) else { return };
+                p.held = true;
+                p.timer = None;
+                let (x, y) = (p.x, p.y);
+                drop(gs);
+                if let Some((col, row, _)) = cell_at(x, y) {
+                    with_app(&s, |app| app.long_press(col, row));
+                    fit_keyboard(&s);
                 }
-            } else if let Ok(spec) = KeySpec::parse(&key) {
-                handle(&s, Input { key: spec.key, ctrl: spec.ctrl, alt: spec.alt, shift: spec.shift });
+            });
+            press.timer = window()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(hold.unchecked_ref(), LONG_PRESS_MS)
+                .ok();
+        }
+        g.borrow_mut().press = Some(press);
+    });
+
+    let s = screen.clone();
+    let g = gestures.clone();
+    let mv = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        let mut gs = g.borrow_mut();
+        let Some(p) = gs.press.as_mut().filter(|p| p.id == e.pointer_id()) else { return };
+        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
+        if !p.moved && (x - p.x).hypot(y - p.y) > MOVE_SLOP {
+            p.moved = true;
+            if let Some(t) = p.timer.take() {
+                window().clear_timeout_with_handle(t);
             }
-        });
-        let _ = bar.add_event_listener_with_callback("click", click.as_ref().unchecked_ref());
-        click.forget();
-    }
+        }
+        // A vertical drag scrolls what's under the finger, a row at a time.
+        if !p.touch || !p.moved || p.held || (x - p.x).abs() > (y - p.y).abs() {
+            return;
+        }
+        let Some((col, row, ch)) = cell_at(p.x, p.y) else { return };
+        let rows = ((p.scrolled_y - y) / ch).trunc();
+        if rows != 0.0 {
+            p.scrolled_y -= rows * ch;
+            drop(gs);
+            with_app(&s, |app| app.scroll(col, row, rows as isize));
+        }
+    });
+
+    let s = screen.clone();
+    let g = gestures.clone();
+    let up = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+        let mut gs = g.borrow_mut();
+        let Some(p) = gs.press.take().filter(|p| p.id == e.pointer_id()) else { return };
+        if let Some(t) = p.timer {
+            window().clear_timeout_with_handle(t);
+        }
+        if p.held {
+            return;
+        }
+        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
+        let (dx, dy) = (x - p.x, y - p.y);
+        if p.moved {
+            drop(gs);
+            if p.touch && dx.abs() > SWIPE_MIN && dx.abs() > 2.0 * dy.abs() {
+                with_app(&s, |app| app.swipe(dx > 0.0));
+            }
+            return fit_keyboard(&s);
+        }
+        let Some((col, row, _)) = cell_at(p.x, p.y) else { return };
+        let now = js_sys::Date::now();
+        let double = gs
+            .last_tap
+            .is_some_and(|(t, c, r)| now - t < DOUBLE_TAP_MS && c.abs_diff(col) <= 1 && r.abs_diff(row) <= 1);
+        gs.last_tap = if double { None } else { Some((now, col, row)) };
+        drop(gs);
+        let handled = with_app(&s, |app| if double { app.double_tap(col, row) } else { app.tap(col, row) });
+        if !handled {
+            tap_screen(&s, col, row);
+        }
+        fit_keyboard(&s);
+    });
+
+    let g = gestures.clone();
+    let cancel = Closure::<dyn FnMut(PointerEvent)>::new(move |_: PointerEvent| {
+        if let Some(t) = g.borrow_mut().press.take().and_then(|p| p.timer) {
+            window().clear_timeout_with_handle(t);
+        }
+    });
+
+    let s = screen.clone();
+    let wheel = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
+        let Some((col, row, ch)) = cell_at(e.client_x() as f64, e.client_y() as f64) else { return };
+        e.prevent_default();
+        let px = match e.delta_mode() {
+            WheelEvent::DOM_DELTA_LINE => e.delta_y() * ch,
+            WheelEvent::DOM_DELTA_PAGE => e.delta_y() * ch * 20.0,
+            _ => e.delta_y(),
+        };
+        let rows = (px / ch).round().clamp(-10.0, 10.0) as isize;
+        let rows = if rows == 0 { px.signum() as isize } else { rows };
+        with_app(&s, |app| app.scroll(col, row, rows));
+    });
+
+    // A right click is the long press of a mouse.
+    let s = screen.clone();
+    let context = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+        let Some((col, row, _)) = cell_at(e.client_x() as f64, e.client_y() as f64) else { return };
+        if with_app(&s, |app| app.long_press(col, row)) {
+            e.prevent_default();
+        }
+    });
+
+    let on = |name: &str, f: &JsValue| {
+        let _ = term.add_event_listener_with_callback(name, f.unchecked_ref());
+    };
+    on("pointerdown", down.as_ref());
+    on("pointermove", mv.as_ref());
+    on("pointerup", up.as_ref());
+    on("pointercancel", cancel.as_ref());
+    on("contextmenu", context.as_ref());
+    let opts = web_sys::AddEventListenerOptions::new();
+    opts.set_passive(false);
+    let _ = term.add_event_listener_with_callback_and_add_event_listener_options(
+        "wheel",
+        wheel.as_ref().unchecked_ref(),
+        &opts,
+    );
+    down.forget();
+    mv.forget();
+    up.forget();
+    cancel.forget();
+    wheel.forget();
+    context.forget();
 
     // Typing on the on-screen keyboard. Keys with a real `key` already arrived as keydown and
     // were cancelled there; this catches the rest (predictive text, autocorrect, dictation).
-    let s = screen.clone();
-    let k = kbd.clone();
-    let input = Closure::<dyn FnMut(InputEvent)>::new(move |e: InputEvent| {
-        if e.is_composing() {
-            return;
-        }
-        e.prevent_default();
-        let keys: Vec<Key> = match e.input_type().as_str() {
-            "insertText" | "insertReplacementText" => e.data().unwrap_or_default().chars().map(Key::Char).collect(),
-            "insertLineBreak" | "insertParagraph" => vec![Key::Enter],
-            "deleteContentBackward" => vec![Key::Backspace],
-            "deleteContentForward" => vec![Key::Delete],
-            _ => vec![],
-        };
-        for key in keys {
-            handle(&s, Input { key, ..Input::default() });
-        }
-        k.set_value("");
-    });
-    let _ = kbd.add_event_listener_with_callback("beforeinput", input.as_ref().unchecked_ref());
-    input.forget();
-
-    // Tapping the sign-in screen signs in, since there's no Enter key to press.
-    if let Some(term) = element::<HtmlElement>("term") {
+    if let Some(kbd) = element::<HtmlTextAreaElement>("kbd") {
         let s = screen.clone();
-        let tap = Closure::<dyn FnMut()>::new(move || {
-            let login = matches!(&*s.borrow(), Screen::Login);
-            if login {
-                handle(&s, Input { key: Key::Enter, ..Input::default() });
+        let k = kbd.clone();
+        let input = Closure::<dyn FnMut(InputEvent)>::new(move |e: InputEvent| {
+            if e.is_composing() {
+                return;
             }
+            e.prevent_default();
+            let keys: Vec<Key> = match e.input_type().as_str() {
+                "insertText" | "insertReplacementText" => e.data().unwrap_or_default().chars().map(Key::Char).collect(),
+                "insertLineBreak" | "insertParagraph" => vec![Key::Enter],
+                "deleteContentBackward" => vec![Key::Backspace],
+                "deleteContentForward" => vec![Key::Delete],
+                _ => vec![],
+            };
+            for key in keys {
+                handle(&s, Input { key, ..Input::default() });
+            }
+            k.set_value("");
+            fit_keyboard(&s);
         });
-        let _ = term.add_event_listener_with_callback("click", tap.as_ref().unchecked_ref());
-        tap.forget();
+        let _ = kbd.add_event_listener_with_callback("beforeinput", input.as_ref().unchecked_ref());
+        input.forget();
     }
 
     // The on-screen keyboard shrinks the visual viewport only: fit the page to it, and tell
@@ -590,6 +787,7 @@ fn draw(f: &mut Frame, screen: &Shared) {
 fn draw_screen(f: &mut Frame, screen: &Shared) {
     let mut s = screen.borrow_mut();
     let hint = |t: &str| Line::styled(t.to_string(), Style::new().fg(Color::DarkGray));
+    TAPS.with(|t| t.borrow_mut().clear());
     match &mut *s {
         Screen::App(app, ctx) => {
             let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
@@ -604,31 +802,36 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
             ctx.persist();
             gition::ui::draw(f, app);
         }
-        Screen::Message(m) => dialog(f, "gition", vec![Line::raw(m.clone())]),
-        Screen::Error(m) => dialog(
-            f,
-            "gition",
-            vec![
-                Line::styled(m.clone(), Style::new().fg(Color::Red)),
-                Line::raw(""),
-                hint("Enter reload · p pick another repository"),
-            ],
-        ),
-        Screen::Login => dialog(
-            f,
-            "gition",
-            vec![
-                Line::raw("A notebook stored as markdown in a GitHub repo."),
-                Line::raw(""),
-                Line::styled(
-                    if touch() { "Tap to sign in with GitHub" } else { "Press Enter to sign in with GitHub" },
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Line::raw(""),
-                hint("Notes go straight from your browser to GitHub; this server stores nothing."),
-                hint("gition only sees the repos you install the app on."),
-            ],
-        ),
+        Screen::Message(m) => {
+            dialog(f, "gition", vec![Line::raw(m.clone())]);
+        }
+        Screen::Error(m) => {
+            const HINT: &str = "Enter reload · p pick another repository";
+            let rows = dialog(
+                f,
+                "gition",
+                vec![Line::styled(m.clone(), Style::new().fg(Color::Red)), Line::raw(""), hint(HINT)],
+            );
+            hint_taps(rows.last(), HINT);
+        }
+        Screen::Login => {
+            add_tap(f.area(), Tap::Key(Input { key: Key::Enter, ..Input::default() }));
+            dialog(
+                f,
+                "gition",
+                vec![
+                    Line::raw("A notebook stored as markdown in a GitHub repo."),
+                    Line::raw(""),
+                    Line::styled(
+                        if touch() { "Tap to sign in with GitHub" } else { "Press Enter to sign in with GitHub" },
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    hint("Notes go straight from your browser to GitHub; this server stores nothing."),
+                    hint("gition only sees the repos you install the app on."),
+                ],
+            );
+        }
         Screen::Repos { repos, sel, .. } => {
             let mut lines = vec![Line::raw("Open a repository:"), Line::raw("")];
             if repos.is_empty() {
@@ -636,34 +839,51 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
             }
             let max = f.area().height.saturating_sub(10) as usize;
             let start = sel.saturating_sub(max.saturating_sub(1));
+            let mut shown = Vec::new();
             for (i, r) in repos.iter().enumerate().skip(start).take(max.max(1)) {
                 let style = if i == *sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                shown.push((lines.len(), i));
                 lines.push(Line::styled(format!(" {r} "), style));
             }
             lines.push(Line::raw(""));
-            lines.push(hint("j/k move · Enter open · i add repositories · r refresh"));
-            dialog(f, "gition", lines);
+            const HINT: &str = "j/k move · Enter open · i add repositories · r refresh";
+            lines.push(hint(HINT));
+            let rows = dialog(f, "gition", lines);
+            for (line, i) in shown {
+                if let Some(&r) = rows.get(line) {
+                    add_tap(r, Tap::Repo(i));
+                }
+            }
+            hint_taps(rows.last(), HINT);
         }
-        Screen::Init(ctx) => dialog(
-            f,
-            "gition",
-            vec![
-                Line::raw(format!("{} has no INDEX.md.", ctx.api.full_name())),
-                Line::raw("Create a gition workspace? Nothing is committed until you sync."),
-                Line::raw(""),
-                hint("y create · n pick another repository"),
-            ],
-        ),
-        Screen::Empty { full_name, .. } => dialog(
-            f,
-            "gition",
-            vec![
-                Line::raw(format!("{full_name} is empty.")),
-                Line::raw("Commit an INDEX.md to start a gition workspace?"),
-                Line::raw(""),
-                hint("y commit · n pick another repository"),
-            ],
-        ),
+        Screen::Init(ctx) => {
+            const HINT: &str = "y create · n pick another repository";
+            let rows = dialog(
+                f,
+                "gition",
+                vec![
+                    Line::raw(format!("{} has no INDEX.md.", ctx.api.full_name())),
+                    Line::raw("Create a gition workspace? Nothing is committed until you sync."),
+                    Line::raw(""),
+                    hint(HINT),
+                ],
+            );
+            hint_taps(rows.last(), HINT);
+        }
+        Screen::Empty { full_name, .. } => {
+            const HINT: &str = "y commit · n pick another repository";
+            let rows = dialog(
+                f,
+                "gition",
+                vec![
+                    Line::raw(format!("{full_name} is empty.")),
+                    Line::raw("Commit an INDEX.md to start a gition workspace?"),
+                    Line::raw(""),
+                    hint(HINT),
+                ],
+            );
+            hint_taps(rows.last(), HINT);
+        }
     }
 }
 
@@ -694,15 +914,54 @@ fn theme(c: Color, bg: bool) -> Color {
     }
 }
 
-fn dialog(f: &mut Frame, title: &str, lines: Vec<Line>) {
+/// Draws a centered box; returns where each line went.
+fn dialog(f: &mut Frame, title: &str, lines: Vec<Line>) -> Vec<Rect> {
     let area = f.area();
     let w = 72.min(area.width);
     // Count wrapped rows so narrow screens don't cut the last lines off.
     let inner = w.saturating_sub(2).max(1) as usize;
-    let rows: usize = lines.iter().map(|l| l.width().div_ceil(inner).max(1)).sum();
-    let h = (rows as u16 + 2).min(area.height);
+    let heights: Vec<u16> = lines.iter().map(|l| l.width().div_ceil(inner).max(1) as u16).collect();
+    let h = (heights.iter().sum::<u16>() + 2).min(area.height);
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 3, w, h);
     f.render_widget(Clear, r);
     let block = Block::bordered().title(format!(" {title} ")).border_style(Style::new().fg(Color::Cyan));
     f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), r);
+    let mut y = r.y + 1;
+    heights
+        .iter()
+        .map(|&h| {
+            let line = Rect::new(r.x + 1, y, inner as u16, h);
+            y += h;
+            line
+        })
+        .collect()
+}
+
+/// What a tap on the screens before the app does.
+#[derive(Clone)]
+enum Tap {
+    Key(Input),
+    Repo(usize),
+}
+
+thread_local! {
+    /// Filled while drawing those screens.
+    static TAPS: RefCell<Vec<(Rect, Tap)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn add_tap(r: Rect, tap: Tap) {
+    TAPS.with(|t| t.borrow_mut().push((r, tap)));
+}
+
+/// Makes each segment of a hint line like "y create · n pick" press its key.
+fn hint_taps(line: Option<&Rect>, text: &str) {
+    let Some(line) = line else { return };
+    let mut x = line.x;
+    for seg in text.split(" · ") {
+        let w = Line::raw(seg).width() as u16;
+        if let Some(k) = gition::pointer::hint_key(seg) {
+            add_tap(Rect::new(x, line.y, w, 1), Tap::Key(k));
+        }
+        x += w + 3;
+    }
 }

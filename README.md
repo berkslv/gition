@@ -49,7 +49,7 @@ The same app also runs in the browser on a GitHub repo, with no local clone. It'
 - Sign in with GitHub, install the gition GitHub App on the repos you want, and pick one. Open `/#owner/repo` to go straight to a repo, or `/#repos` to switch.
 - `Ctrl+S` saves to the browser's working copy, which survives reloads. `Ctrl+G` commits every change in one commit through the GitHub API. If someone pushed in between, gition replays your changes on top of theirs. When both sides changed the same file, it keeps their version and saves yours next to it as `name.conflict.md`.
 - `i` opens a file picker, and `o` opens the file on GitHub. Images show as placeholders.
-- On phones and tablets, a key bar at the bottom adds the keys an on-screen keyboard lacks (`Esc`, `Tab`, arrows, `Enter`, Save, Sync, Tree, `?`), and `⌨` shows or hides the keyboard.
+- Touch and mouse work alongside the keys: tap a page to open it or a link to follow it, double tap to edit, drag or scroll to move, swipe right or left to show or hide the pages. Tap the status bar (☰ Menu), long press or right click for a menu of actions. On phones the keyboard comes up only while there's something to type.
 - Privacy: your notes go straight from your browser to GitHub. The Worker only handles sign-in and keeps nothing: your GitHub tokens live in an encrypted cookie in your browser. gition can only reach the repos you install the [gition-notes](https://github.com/apps/gition-notes) App on, and you can remove it any time in your GitHub settings.
 
 ## Keys

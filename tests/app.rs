@@ -203,3 +203,49 @@ fn works_on_in_memory_storage() {
     key(&mut app, Key::Char('y'));
     assert!(!fs.exists(Path::new("Projects")));
 }
+
+/// Where a tree row was drawn in the last frame.
+fn row_of(app: &App, path: &str) -> (u16, u16) {
+    let i = app.visible.iter().position(|v| v.path == Path::new(path)).unwrap();
+    let (r, _) = app.hits.iter().find(|(_, t)| matches!(t, gition::pointer::Target::TreeRow(n) if *n == i)).unwrap();
+    (r.x, r.y)
+}
+
+#[test]
+fn touch_opens_edits_and_uses_the_menu() {
+    let (_tmp, root) = workspace();
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
+    app.touch = true;
+    key(&mut app, Key::Enter); // expand the root
+    render(&mut app);
+
+    // Tap a page in the tree to open it; a tap on a link line follows it.
+    let (x, y) = row_of(&app, "ideas.md");
+    app.tap(x, y);
+    assert_eq!(app.page.as_ref().unwrap().path, Path::new("ideas.md"));
+    let t = render(&mut app);
+    assert!(format!("{:?}", t.backend()).contains("☰ Menu"));
+
+    // Double tap the page to edit it, then save and leave through the menu.
+    app.double_tap(60, 3);
+    assert!(app.editor.is_some() && app.wants_text());
+    typ(&mut app, "x");
+    render(&mut app);
+    app.tap(1, 15); // the status bar
+    let t = render(&mut app);
+    let screen = format!("{:?}", t.backend());
+    assert!(screen.contains("Done editing"), "{screen}");
+    let save = app.hits.iter().find(|(_, t)| matches!(t, gition::pointer::Target::MenuItem(0))).unwrap().0;
+    app.tap(save.x, save.y);
+    assert!(fs::read_to_string(root.join("ideas.md")).unwrap().starts_with('x'));
+
+    // Long press a tree row for its menu; tapping outside closes it.
+    render(&mut app);
+    let (x, y) = row_of(&app, "Projects");
+    app.long_press(x, y);
+    assert!(matches!(app.modal, gition::app::Modal::Menu { .. }));
+    assert_eq!(app.visible[app.sel].path, Path::new("Projects"));
+    render(&mut app);
+    app.tap(0, 0);
+    assert!(matches!(app.modal, gition::app::Modal::None));
+}
