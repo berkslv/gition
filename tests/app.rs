@@ -85,6 +85,7 @@ fn rename_moves_page_and_rewrites_links() {
     assert!(moved.contains("[ideas](../ideas.md)"), "{moved}");
 }
 
+#[cfg(unix)]
 fn run_command(app: &mut App, cmd: &str) {
     key(app, Key::Char('!'));
     typ(app, cmd);
