@@ -42,6 +42,16 @@ gition walks up from the current directory to the nearest `INDEX.md`. If there i
 - Moving or renaming a page rewrites every relative link to and from it.
 - `Ctrl+G` saves, runs `git add -A`, commits with a message listing the changed files, then pulls with `--rebase` and pushes. On startup gition fetches, and fast-forwards when that's safe.
 
+### Import from Notion
+
+In Notion, export your pages as "Markdown & CSV" and unzip the export. Then run:
+
+```sh
+gition ~/notes import notion ~/Downloads/notion-export
+```
+
+The pages are copied into `~/notes`, or into the folder you name. A page with subpages becomes a folder with an `INDEX.md`. A database becomes a page with a table that links to its rows, and each row's properties become front matter at the top of its page. Attachments go into `assets/`, and links between pages are rewritten to the new paths. With `--database-as-table` (`gition ~/notes import notion --database-as-table EXPORT`), a database becomes a page with a plain table, with no page per row. Nothing is overwritten: a title that's already taken gets a number. Nothing is committed either; press `Ctrl+G` in gition to sync.
+
 ## Web
 
 The same app also runs in the browser on a GitHub repo, with no local clone. It's in `web/` and deploys to Cloudflare Workers.
@@ -56,9 +66,9 @@ The same app also runs in the browser on a GitHub repo, with no local clone. It'
 
 | Where  | Keys |
 |--------|------|
-| Global | `Tab` switch focus · `/` find page · `Ctrl+G` sync · `Ctrl+B` toggle tree · `?` help · `q` quit |
+| Global | `Tab` switch focus · `/` find page · `Ctrl+G` sync · `Ctrl+B` toggle tree · `?` help · `q`/`Ctrl+C` quit |
 | Tree   | `j/k` move · `l`/`Enter` open · `h` collapse · `n` new page · `N` new folder · `r` rename/move · `d` delete · `i` insert image · `.` show all files |
-| Page   | `j/k` move · `PgUp/PgDn` · `e` edit · `Enter` follow link · `o` open externally |
+| Page   | `j/k` move · `PgUp/PgDn` · `e`/`Enter` edit · `Space` follow link · `o` open externally |
 | Editor | type normally · `Ctrl+S` save · `Ctrl+Z/Y` undo/redo · `Esc` back |
 
 ## Config

@@ -267,9 +267,8 @@ fn handle(screen: &Shared, input: Input) -> bool {
             Screen::App(app, _) => {
                 // Leave browser shortcuts (copy, paste, reload, …) alone unless gition binds them.
                 let bound = Action::ALL.iter().any(|&a| app.keys.is(a, &input));
-                let take = plain
-                    || bound
-                    || app.editor.is_some() && input.ctrl && !matches!(input.key, Key::Char('c' | 'v' | 'x'));
+                let clipboard = input.ctrl && matches!(input.key, Key::Char('c' | 'v' | 'x'));
+                let take = !clipboard && (plain || bound || app.editor.is_some() && input.ctrl);
                 if take {
                     app.on_key(input.clone());
                 }
@@ -652,6 +651,19 @@ fn listen_touch(screen: &Shared) {
         wheel.as_ref().unchecked_ref(),
         &opts,
     );
+    // iOS Safari ignores the viewport's no-zoom settings and can still zoom on a double tap
+    // or a pinch. Taps and gestures are gition's, so cancel the browser's.
+    let no_zoom = Closure::<dyn FnMut(Event)>::new(|e: Event| e.prevent_default());
+    if let Some(doc) = w.document() {
+        for name in ["touchend", "dblclick", "gesturestart"] {
+            let _ = doc.add_event_listener_with_callback_and_add_event_listener_options(
+                name,
+                no_zoom.as_ref().unchecked_ref(),
+                &opts,
+            );
+        }
+    }
+    no_zoom.forget();
     down.forget();
     mv.forget();
     up.forget();
@@ -694,6 +706,10 @@ fn listen_touch(screen: &Shared) {
             let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else {
                 return;
             };
+            // While zoomed in, the visual viewport is the zoomed area, not the keyboard's room.
+            if (vv.scale() - 1.0).abs() > 0.01 {
+                return;
+            }
             let height = format!("{}px", vv.height());
             if body.style().get_property_value("height").ok().as_deref() != Some(height.as_str()) {
                 let _ = body.style().set_property("height", &height);

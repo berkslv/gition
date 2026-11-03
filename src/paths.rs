@@ -63,6 +63,8 @@ pub fn encode_link(s: &str) -> String {
     for ch in s.chars() {
         match ch {
             ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
             '(' => out.push_str("%28"),
             ')' => out.push_str("%29"),
             '<' => out.push_str("%3C"),
@@ -111,6 +113,7 @@ mod tests {
     #[test]
     fn percent_roundtrip() {
         assert_eq!(percent_decode(&encode_link("my page (1).md")), "my page (1).md");
+        assert_eq!(encode_link("C#/why?.md"), "C%23/why%3F.md");
         assert_eq!(percent_decode("100%"), "100%");
     }
 }

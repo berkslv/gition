@@ -184,8 +184,8 @@ const VIEW: &[Action] = &[
     Action::Down,
     Action::PageUp,
     Action::PageDown,
-    Action::Edit,
     Action::Follow,
+    Action::Edit,
     Action::OpenExternal,
     Action::Collapse,
 ];
@@ -675,7 +675,9 @@ impl App {
     }
 
     fn edit_key(&mut self, k: Input) {
-        match self.action(&k, EDIT) {
+        // Plain quit keys type text here; only the ones with a modifier quit.
+        let quit = (k.ctrl || k.alt) && self.keys.is(Action::Quit, &k);
+        match self.action(&k, EDIT).or(quit.then_some(Action::Quit)) {
             Some(a) => self.edit_action(a),
             None => {
                 if let Some(e) = &mut self.editor {
@@ -716,15 +718,16 @@ impl App {
             Action::PageUp => self.sel = self.sel.saturating_sub(10),
             Action::PageDown => self.sel = (self.sel + 10).min(self.visible.len().saturating_sub(1)),
             Action::Open => {
-                if node.is_dir {
-                    if !node.path.as_os_str().is_empty() {
-                        self.expanded.insert(node.path.clone());
-                        self.refilter();
-                    }
+                // A closed folder opens first; once open, the next press goes into its page like a file.
+                if node.is_dir && !node.expanded {
+                    self.expanded.insert(node.path.clone());
+                    self.refilter();
                     self.request_open(node.path);
                 } else {
                     self.request_open(node.path);
-                    self.focus = Focus::Page;
+                    if !self.page.as_ref().is_some_and(|p| matches!(p.kind, PageKind::Folder)) {
+                        self.focus = Focus::Page;
+                    }
                 }
             }
             Action::Collapse => {
@@ -736,8 +739,18 @@ impl App {
                 }
             }
             Action::Edit => {
+                if node.is_dir && !node.expanded {
+                    self.expanded.insert(node.path.clone());
+                    self.refilter();
+                }
                 self.request_open(node.path);
-                if self.modal_is_none() {
+                if !self.modal_is_none() || self.page.as_ref().is_some_and(|p| matches!(p.kind, PageKind::Folder)) {
+                    return;
+                }
+                // Editing this page already: go back to it rather than reload it from disk.
+                if self.editor.is_some() {
+                    self.focus = Focus::Page;
+                } else {
                     self.start_edit();
                 }
             }

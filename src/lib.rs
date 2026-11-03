@@ -4,6 +4,7 @@ pub mod config;
 pub mod git;
 pub mod host;
 pub mod images;
+pub mod import;
 pub mod keymap;
 pub mod links;
 pub mod markdown;

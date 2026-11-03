@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use gition::app::App;
+use gition::app::{App, Focus};
 use gition::config::Config;
 use gition::host::{Host, Msg, Open};
 use gition::images::Images;
@@ -65,9 +65,8 @@ fn renders_tree_and_page() {
 fn rename_moves_page_and_rewrites_links() {
     let (_tmp, root) = workspace();
     let mut app = App::open_dir(root.clone(), Config::default(), None);
-    key(&mut app, Key::Enter); // expand root -> opens INDEX
     select(&mut app, "Projects");
-    key(&mut app, Key::Enter);
+    key(&mut app, Key::Right);
     select(&mut app, "Projects/plan.md");
     key(&mut app, Key::Char('r'));
     for _ in 0.."Projects/plan".len() {
@@ -135,13 +134,56 @@ fn insert_image_copies_into_assets() {
     fs::write(&src, "png bytes").unwrap();
     let mut app = App::open_dir(root.clone(), Config::default(), None);
     select(&mut app, "Projects");
-    key(&mut app, Key::Enter); // opens Projects/INDEX.md
+    key(&mut app, Key::Right); // opens Projects/INDEX.md
     key(&mut app, Key::Char('i'));
     app.on_paste(format!("\"{}\"", src.display()));
     key(&mut app, Key::Enter);
     assert_eq!(fs::read(root.join("assets/photo shot.png")).unwrap(), b"png bytes");
     let page = fs::read_to_string(root.join("Projects/INDEX.md")).unwrap();
     assert_eq!(page, "# Projects\n\n![photo shot](../assets/photo%20shot.png)\n");
+}
+
+#[test]
+fn tree_opens_pages_and_enter_on_a_page_edits_it() {
+    let (_tmp, root) = workspace();
+    let mut app = App::open_dir(root, Config::default(), None);
+    select(&mut app, "ideas.md");
+    key(&mut app, Key::Enter);
+    assert_eq!(app.page.as_ref().unwrap().path, Path::new("ideas.md"));
+    assert!(app.editor.is_none() && app.focus == Focus::Page);
+    key(&mut app, Key::Enter);
+    assert_eq!(app.editor.as_ref().unwrap().path, Path::new("ideas.md"));
+    key(&mut app, Key::Esc);
+    key(&mut app, Key::Tab);
+
+    // The first press opens a closed folder and stays in the tree; the second goes into its page.
+    select(&mut app, "Projects");
+    key(&mut app, Key::Right);
+    assert!(app.focus == Focus::Tree);
+    assert!(app.visible.iter().any(|v| v.path == Path::new("Projects/plan.md")));
+    key(&mut app, Key::Right);
+    assert_eq!(app.page.as_ref().unwrap().path, Path::new("Projects/INDEX.md"));
+    assert!(app.editor.is_none() && app.focus == Focus::Page);
+}
+
+#[test]
+fn ctrl_c_quits_and_asks_to_save_from_the_editor() {
+    let (_tmp, root) = workspace();
+    let ctrl_c = Input { key: Key::Char('c'), ctrl: true, ..Input::default() };
+    let mut app = App::open_dir(root.clone(), Config::default(), None);
+    select(&mut app, "ideas.md");
+    key(&mut app, Key::Enter);
+    key(&mut app, Key::Enter);
+    typ(&mut app, "q");
+    assert!(!app.quit);
+    app.on_key(ctrl_c.clone());
+    assert!(matches!(app.modal, gition::app::Modal::SaveChanges(_)));
+    key(&mut app, Key::Char('n'));
+    assert!(app.quit);
+
+    let mut app = App::open_dir(root, Config::default(), None);
+    app.on_key(ctrl_c);
+    assert!(app.quit);
 }
 
 #[test]
@@ -182,9 +224,8 @@ fn works_on_in_memory_storage() {
     let fs = Rc::new(MemStorage::new("notes", files));
     let mut app =
         App::new(Box::new(fs.clone()), Box::new(Offline), Config::default(), Images::new(PathBuf::new(), None));
-    key(&mut app, Key::Enter);
     select(&mut app, "Projects");
-    key(&mut app, Key::Enter);
+    key(&mut app, Key::Right);
     select(&mut app, "Projects/plan.md");
     key(&mut app, Key::Char('r'));
     for _ in 0.."Projects/plan".len() {
@@ -216,7 +257,6 @@ fn touch_opens_edits_and_uses_the_menu() {
     let (_tmp, root) = workspace();
     let mut app = App::open_dir(root.clone(), Config::default(), None);
     app.touch = true;
-    key(&mut app, Key::Enter); // expand the root
     render(&mut app);
 
     // Tap a page in the tree to open it; a tap on a link line follows it.

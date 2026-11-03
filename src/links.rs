@@ -9,7 +9,10 @@ use crate::paths;
 use crate::storage::Storage;
 
 pub fn md_options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
 }
 
 /// An inline link or image destination and its byte range in the source.

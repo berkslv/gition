@@ -24,7 +24,7 @@ macro_rules! actions {
 
 actions! {
     // global
-    Quit => "quit", "quit", ["q"];
+    Quit => "quit", "quit", ["q", "ctrl+c"];
     Help => "help", "show this help", ["?"];
     Search => "search", "fuzzy-find a page", ["/"];
     Sync => "sync", "save, commit everything, pull --rebase, push", ["ctrl+g"];
@@ -44,8 +44,8 @@ actions! {
     // view
     PageUp => "page_up", "page up", ["pageup"];
     PageDown => "page_down", "page down", ["pagedown"];
-    Edit => "edit", "edit page", ["e"];
-    Follow => "follow", "follow link / open image on line", ["enter"];
+    Edit => "edit", "edit page", ["e", "enter"];
+    Follow => "follow", "follow link / open image on line", ["space"];
     OpenExternal => "open_external", "open with system app", ["o"];
     // edit
     Save => "save", "save", ["ctrl+s"];

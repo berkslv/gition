@@ -41,6 +41,7 @@ struct Renderer {
     item_indents: Vec<usize>,
     bullet: Option<String>,
     in_code: bool,
+    in_meta: bool,
     image: Option<(String, String)>,
 }
 
@@ -102,6 +103,15 @@ impl Renderer {
             Event::Text(t) => {
                 if let Some((_, alt)) = &mut self.image {
                     alt.push_str(&t);
+                } else if self.in_meta {
+                    // Front matter: one dim `key: value` line per property.
+                    for l in t.lines().filter(|l| !l.trim().is_empty()) {
+                        let (key, value) = l.split_once(':').unwrap_or((l, ""));
+                        self.push_line(vec![
+                            Span::styled(format!("{key}: "), DIM),
+                            Span::raw(value.trim().trim_matches('"').to_string()),
+                        ]);
+                    }
                 } else if self.in_code {
                     for l in t.split_terminator('\n') {
                         self.push_line(vec![Span::raw("  "), Span::styled(l.to_string(), CODE)]);
@@ -148,6 +158,10 @@ impl Renderer {
             Tag::BlockQuote(_) => {
                 self.flush();
                 self.quote += 1;
+            }
+            Tag::MetadataBlock(_) => {
+                self.flush();
+                self.in_meta = true;
             }
             Tag::CodeBlock(_) => {
                 self.flush();
@@ -208,6 +222,10 @@ impl Renderer {
                 if self.quote == 0 {
                     self.blank();
                 }
+            }
+            TagEnd::MetadataBlock(_) => {
+                self.in_meta = false;
+                self.blank();
             }
             TagEnd::CodeBlock => {
                 self.in_code = false;
@@ -320,6 +338,12 @@ mod tests {
                 Block::Image { dest, alt } => format!("[img {alt} {dest}]"),
             })
             .collect()
+    }
+
+    #[test]
+    fn renders_front_matter_as_properties() {
+        let blocks = render("---\nStatus: Done\nTitle: \"a: b\"\n---\n\n# A\n");
+        assert_eq!(text(&blocks), ["Status: Done", "Title: a: b", "", "A"]);
     }
 
     #[test]
