@@ -13,11 +13,19 @@ A Notion-style notebook for the terminal. Pages are plain markdown files in a gi
 
 ## Install
 
+macOS / Linux:
+
 ```sh
-cargo install gition
+curl -fsSL https://raw.githubusercontent.com/berkslv/gition/main/install.sh | sh
 ```
 
-Or download a prebuilt binary for Windows, macOS or Linux from [Releases](https://github.com/berkslv/gition/releases).
+Windows:
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/berkslv/gition/main/install.ps1 | iex"
+```
+
+Or `cargo install gition`, or download a binary from [Releases](https://github.com/berkslv/gition/releases). The scripts accept `GITION_VERSION` and `GITION_INSTALL_DIR`.
 
 Requires `git` on your PATH.
 

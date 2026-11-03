@@ -20,3 +20,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # Installs the latest release with the scripts in this checkout.
+  install-scripts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os != 'Windows'
+        run: |
+          GITION_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/gition" --version
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:GITION_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
+          ./install.ps1
+          & "$env:RUNNER_TEMP\bin\gition.exe" --version
