@@ -581,7 +581,13 @@ fn pasted_image_path_is_imported() {
     let src = tmp.path().join("Screen Shot.png");
     fs::write(&src, "png bytes").unwrap();
     let (mut app, fs, _) = paste_app(Config::default(), None);
-    app.on_paste(src.display().to_string().replace(' ', "\\ "));
+    // A dropped file, as the terminal pastes it: quoted on Windows, backslash-escaped elsewhere.
+    let pasted = if cfg!(windows) {
+        format!("\"{}\"", src.display())
+    } else {
+        src.display().to_string().replace(' ', "\\ ")
+    };
+    app.on_paste(pasted);
     assert_eq!(first_line(&app), "# Notes ![Screen Shot](assets/Screen%20Shot.png)");
     assert_eq!(fs.read(Path::new("assets/Screen Shot.png")).unwrap(), b"png bytes");
 
