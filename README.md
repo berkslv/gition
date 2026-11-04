@@ -26,7 +26,7 @@ Or `cargo install gition`, or grab a binary from [Releases](https://github.com/b
 cd ~/notes && gition      # or: gition ~/notes
 ```
 
-gition opens the nearest folder with an `INDEX.md`, or offers to set one up (git repo, `INDEX.md`, `assets/`, config and a first commit).
+gition opens the git repo you start it in, or the nearest folder above with an `INDEX.md`. Outside a git repo it offers to set one up (git repo, `INDEX.md`, `assets/`, config and a first commit).
 
 - `a.md` is a page; a folder is a page when it has `a/INDEX.md`.
 - Images go into `assets/` with relative links, so they render on GitHub too. Paste or drop an image path, or press `Ctrl+V` for a clipboard image.

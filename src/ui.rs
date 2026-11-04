@@ -57,7 +57,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
             if is_current {
                 style = style.fg(th.current).add_modifier(Modifier::BOLD);
             }
-            let indent = "  ".repeat(v.depth.saturating_sub(1));
+            let indent = "  ".repeat(v.depth);
             ListItem::new(Line::from(vec![
                 Span::raw(indent),
                 Span::styled(icon, Style::new().fg(th.dim)),
@@ -146,15 +146,27 @@ fn draw_image(f: &mut Frame, app: &mut App, path: &std::path::Path, area: Rect) 
 }
 
 #[cfg(not(feature = "native"))]
-fn draw_image(_f: &mut Frame, _app: &mut App, _path: &std::path::Path, _area: Rect) -> bool {
-    false
+fn draw_image(f: &mut Frame, app: &mut App, path: &std::path::Path, area: Rect) -> bool {
+    match app.images.fit(path, ratatui::layout::Size::new(area.width, area.height)) {
+        Some(s) => {
+            show_image(f, &mut app.images, path, Rect::new(area.x, area.y, s.width, s.height));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Leaves a slot for the frontend to show the image in.
+#[cfg(not(feature = "native"))]
+fn show_image(f: &mut Frame, images: &mut crate::images::Images, path: &std::path::Path, area: Rect) {
+    f.buffer_mut().set_style(area, Style::new().bg(crate::images::SLOT));
+    images.show(path, area);
 }
 
 fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     let th = app.cfg.theme;
     app.layout(inner.width, inner.height);
     app.view.area = inner;
-    #[cfg_attr(not(feature = "native"), allow(unused_variables))]
     let App { view, images, page, hits, .. } = app;
     let Some(page) = page else { return };
     let blocks: &[Block] = match &page.kind {
@@ -190,13 +202,13 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
                         _ => continue,
                     };
                     let Some((target, _)) = links::resolve(&page.path, dest) else { continue };
+                    let r = Rect::new(inner.x, y, size.width, size.height);
                     #[cfg(feature = "native")]
                     if let Some(proto) = images.protocol(&target, *size) {
-                        let r = Rect::new(inner.x, y, size.width, size.height);
                         f.render_widget(ratatui_image::Image::new(proto), r);
                     }
                     #[cfg(not(feature = "native"))]
-                    let _ = target;
+                    show_image(f, images, &target, r);
                 } else if *part == 0 || i == view.scroll {
                     // Partly scrolled out: graphics protocols can't clip, show a label instead.
                     f.render_widget(placeholder(*block), rect);

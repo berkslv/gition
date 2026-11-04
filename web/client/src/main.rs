@@ -2,6 +2,7 @@
 //! Ratzilla, with a GitHub repo as storage.
 
 mod github;
+mod pictures;
 mod workspace;
 
 use std::cell::RefCell;
@@ -11,12 +12,11 @@ use std::rc::Rc;
 use anyhow::{Result, anyhow};
 use gition::app::App;
 use gition::config::{Config, FILE_NAME};
-use gition::images::Images;
+use gition::images::{self, Images};
 use gition::keymap::Action;
 use gition::repo;
 use gition::storage::Storage;
 use ratatui_textarea::{Input, Key};
-use ratzilla::DomBackend;
 use ratzilla::ratatui::Frame;
 use ratzilla::ratatui::Terminal;
 use ratzilla::ratatui::backend::{Backend, ClearType, WindowSize};
@@ -26,6 +26,7 @@ use ratzilla::ratatui::layout::{Position, Size};
 use ratzilla::ratatui::style::{Color, Modifier, Style};
 use ratzilla::ratatui::text::Line;
 use ratzilla::ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratzilla::{CellSized, DomBackend};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -35,6 +36,7 @@ use web_sys::{
 };
 
 use crate::github::{Api, Session, status};
+use crate::pictures::Pictures;
 use crate::workspace::{Ctx, WebHost, get_item, set_item};
 
 const LAST_REPO: &str = "gition:last";
@@ -49,8 +51,6 @@ enum Screen {
         repos: Vec<String>,
         sel: usize,
     },
-    /// The repo has no INDEX.md yet.
-    Init(Rc<Ctx>),
     /// The repo has no commits at all.
     Empty {
         session: Session,
@@ -125,7 +125,7 @@ fn main() {
         {
             let _ = wasm_bindgen_futures::JsFuture::from(ready).await;
         }
-        let grid = Grid { dom: DomBackend::new_by_id("term").expect("DOM backend"), grid: None };
+        let grid = Grid { dom: DomBackend::new_by_id("term").expect("DOM backend"), grid: None, forced: None };
         run(Terminal::new(grid).expect("terminal"), screen);
     });
 }
@@ -141,11 +141,12 @@ fn run(mut terminal: Terminal<Grid>, screen: Shared) {
         if rebuilt {
             let _ = terminal.clear();
         }
-        let changed = prepare(&screen);
-        if (DIRTY.with(|d| d.replace(false)) || changed || rebuilt)
-            && let Err(e) = terminal.draw(|f| draw(f, &screen))
-        {
-            web_sys::console::error_1(&e.to_string().into());
+        let changed = prepare(&screen, terminal.backend().dom.cell_size_px());
+        if DIRTY.with(|d| d.replace(false)) || changed || rebuilt {
+            if let Err(e) = terminal.draw(|f| draw(f, &screen)) {
+                web_sys::console::error_1(&e.to_string().into());
+            }
+            show_pictures(&screen, terminal.backend().dom.cell_size_css_px());
         }
         request_frame(&next);
     }));
@@ -232,11 +233,7 @@ async fn open_repo(screen: &Shared, session: Session, full_name: &str) -> Result
         return Ok(());
     };
     let ctx = Ctx::open(api, branch, head).await?;
-    if repo::dir_has_index(&*ctx.work, Path::new("")) {
-        start_app(screen, ctx);
-    } else {
-        set(screen, Screen::Init(ctx));
-    }
+    start_app(screen, ctx);
     Ok(())
 }
 
@@ -303,7 +300,6 @@ enum Then {
     OpenTab(String),
     Open(Session, String),
     Repos(Session),
-    Init(Rc<Ctx>),
     InitEmpty(Session, String),
 }
 
@@ -327,12 +323,11 @@ fn handle(screen: &Shared, input: Input) -> bool {
         let mut s = screen.borrow_mut();
         match &mut *s {
             Screen::App(app, _) => {
-                // Leave browser shortcuts (copy, paste, reload, …) alone unless gition binds them.
+                // Leave browser shortcuts (paste, reload, …) alone unless gition binds them. Ctrl+C goes
+                // to gition: it copies a selection, and goes back to the repo list without one.
                 let bound = Action::ALL.iter().any(|&a| app.keys.is(a, &input));
-                // Copy goes to gition when its editor has a selection.
-                let selected = app.editor.as_ref().is_some_and(|e| e.selected_text().is_some());
-                let clipboard = input.ctrl && (input.key == Key::Char('v') || input.key == Key::Char('c') && !selected);
-                let take = !clipboard && (plain || bound || app.editor.is_some() && (input.ctrl || input.alt));
+                let paste = input.ctrl && input.key == Key::Char('v');
+                let take = !paste && (plain || bound || app.editor.is_some() && (input.ctrl || input.alt));
                 if take {
                     app.on_key(input.clone());
                 }
@@ -364,14 +359,6 @@ fn handle(screen: &Shared, input: Input) -> bool {
                         then = Then::OpenTab(format!("https://github.com/apps/{app}/installations/new"));
                     }
                     Key::Char('r') => then = Then::Repos(session.clone()),
-                    _ => {}
-                }
-                true
-            }
-            Screen::Init(ctx) if plain => {
-                match input.key {
-                    Key::Char('y') => then = Then::Init(ctx.clone()),
-                    Key::Char('n') | Key::Esc => then = Then::Navigate("/#repos".into()),
                     _ => {}
                 }
                 true
@@ -412,13 +399,6 @@ fn handle(screen: &Shared, input: Input) -> bool {
                 set(&screen, Screen::Error(format!("{e:#}")));
             }
         }),
-        Then::Init(ctx) => {
-            let title = ctx.api.repo.clone();
-            match workspace::init_files(&ctx.work, &title, &Config::default().assets_dir) {
-                Ok(()) => start_app(&screen, ctx),
-                Err(e) => set(&screen, Screen::Error(e.to_string())),
-            }
-        }
         Then::InitEmpty(session, name) => spawn_local(async move {
             let res = async {
                 let (owner, repo_name) = name.split_once('/').unwrap_or_default();
@@ -832,6 +812,8 @@ struct Grid {
     dom: DomBackend,
     /// The grid element of the last frame, to notice when the backend rebuilt it.
     grid: Option<web_sys::Element>,
+    /// The size a rebuild was last forced for, so a rounding difference can't force one each frame.
+    forced: Option<Size>,
 }
 
 impl Grid {
@@ -840,11 +822,29 @@ impl Grid {
     /// Lets the backend (re)build its grid, which it does lazily on the first draw and after
     /// a resize. True when it did, so the whole screen needs drawing again.
     fn sync(&mut self) -> bool {
+        // The backend measures the page when it's created but builds the grid on the first
+        // frame, and forgets a resize in between: a tab opened in the background, where frames
+        // wait, kept a grid sized for another window. Rebuild whenever it doesn't fit.
+        let fits = self.fitting_size();
+        if self.grid.is_some() && fits.is_some() && self.drawn_size() != fits && self.forced != fits {
+            self.forced = fits;
+            if let Ok(e) = Event::new("resize") {
+                let _ = window().dispatch_event(&e);
+            }
+        }
         let _ = self.dom.draw(std::iter::empty());
         let grid = window().document().and_then(|d| d.get_element_by_id(Self::ID));
         let rebuilt = grid != self.grid;
         self.grid = grid;
         rebuilt
+    }
+
+    /// The grid that fits the page now, worked out as the backend does.
+    fn fitting_size(&self) -> Option<Size> {
+        let term = window().document()?.get_element_by_id("term")?.get_bounding_client_rect();
+        let (w, h) = self.dom.cell_size_css_px();
+        let size = Size::new((term.width() / f64::from(w)) as u16, (term.height() / f64::from(h)) as u16);
+        Some(size).filter(|s| s.width > 0 && s.height > 0)
     }
 
     fn drawn_size(&self) -> Option<Size> {
@@ -895,17 +895,26 @@ fn draw(f: &mut Frame, screen: &Shared) {
     draw_screen(f, screen);
     for cell in f.buffer_mut().content.iter_mut() {
         cell.fg = theme(cell.fg, false);
-        cell.bg = theme(cell.bg, true);
+        // Reset is transparent, so the image under the grid shows through.
+        cell.bg = if cell.bg == images::SLOT { Color::Reset } else { theme(cell.bg, true) };
     }
 }
 
-/// Applies what arrived since the last frame: picked and pasted images, finished background
-/// work. Returns whether any of it changed the app.
-fn prepare(screen: &Shared) -> bool {
+/// Applies what arrived since the last frame: picked and pasted images, loaded images,
+/// finished background work. Returns whether any of it changed the app. `cell` is in pixels.
+fn prepare(screen: &Shared, cell: (f32, f32)) -> bool {
     let Screen::App(app, ctx) = &mut *screen.borrow_mut() else { return false };
     let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
     let pasted: Vec<_> = ctx.pasted.borrow_mut().drain(..).collect();
-    let mut changed = !picked.is_empty() || !pasted.is_empty();
+    let arrived = ctx.pictures.take_arrived();
+    let mut changed = !picked.is_empty() || !pasted.is_empty() || !arrived.is_empty();
+    if app.images.set_cell_size(cell) || !arrived.is_empty() {
+        app.relayout();
+        changed = true;
+    }
+    for (path, size) in arrived {
+        app.images.loaded(path, size);
+    }
     for (name, bytes) in picked {
         app.insert_image_data(&name, &bytes);
     }
@@ -913,13 +922,30 @@ fn prepare(screen: &Shared) -> bool {
         app.paste_images(images);
     }
     changed |= app.tick();
-    if app.quit {
-        app.quit = false;
-        app.info("Close the tab to leave gition");
-        changed = true;
+    for path in app.images.take_wanted() {
+        Pictures::want(ctx, path);
     }
     ctx.persist();
+    if app.quit {
+        // Quitting leaves the repo for the repo list; the working copy is saved above.
+        app.quit = false;
+        let _ = window().location().assign("/#repos");
+        let _ = window().location().reload();
+    }
     changed
+}
+
+/// Puts the images where the last frame left slots for them. `cell` is in CSS pixels.
+fn show_pictures(screen: &Shared, cell: (f32, f32)) {
+    let mut s = screen.borrow_mut();
+    match &mut *s {
+        Screen::App(app, ctx) => ctx.pictures.place(ctx, &app.images.take_shown(), cell),
+        _ => {
+            if let Some(layer) = window().document().and_then(|d| d.get_element_by_id("pics")) {
+                layer.set_inner_html("");
+            }
+        }
+    }
 }
 
 fn draw_screen(f: &mut Frame, screen: &Shared) {
@@ -982,20 +1008,6 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
             }
             hint_taps(rows.last(), HINT);
         }
-        Screen::Init(ctx) => {
-            const HINT: &str = "y create · n pick another repository";
-            let rows = dialog(
-                f,
-                "gition",
-                vec![
-                    Line::raw(format!("{} has no INDEX.md.", ctx.api.full_name())),
-                    Line::raw("Create a gition workspace? Nothing is committed until you sync."),
-                    Line::raw(""),
-                    hint(HINT),
-                ],
-            );
-            hint_taps(rows.last(), HINT);
-        }
         Screen::Empty { full_name, .. } => {
             const HINT: &str = "y commit · n pick another repository";
             let rows = dialog(
@@ -1003,7 +1015,7 @@ fn draw_screen(f: &mut Frame, screen: &Shared) {
                 "gition",
                 vec![
                     Line::raw(format!("{full_name} is empty.")),
-                    Line::raw("Commit an INDEX.md to start a gition workspace?"),
+                    Line::raw("Commit a first page to start a gition workspace?"),
                     Line::raw(""),
                     hint(HINT),
                 ],

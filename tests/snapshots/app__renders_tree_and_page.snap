@@ -3,9 +3,9 @@ source: tests/app.rs
 expression: t.backend()
 ---
 "┌ Pages ─────────────────────┐┌ INDEX.md ────────────────────────────────────────────────┐"
-"│▾ notes                     ││Notes                                                     │"
-"│▸ Projects                  ││                                                          │"
-"│  ideas                     ││See the plan and ideas.                                   │"
+"│▸ Projects                  ││Notes                                                     │"
+"│  ideas                     ││                                                          │"
+"│  INDEX                     ││See the plan and ideas.                                   │"
 "│                            ││                                                          │"
 "│                            ││• one                                                     │"
 "│                            ││• two                                                     │"

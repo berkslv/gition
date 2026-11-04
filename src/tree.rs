@@ -38,10 +38,11 @@ impl Filter<'_> {
         if self.show_all {
             return true;
         }
-        if name.starts_with('.') || name == INDEX {
+        let top = rel.parent() == Some(Path::new(""));
+        // A folder's INDEX.md is the folder's own page; the root has no row, so its INDEX.md gets one.
+        if name.starts_with('.') || name == INDEX && !top {
             return false;
         }
-        let top = rel.parent() == Some(Path::new(""));
         if is_dir {
             // Only the top-level assets dir is hidden.
             return !(top && name == self.assets_dir);
@@ -82,8 +83,7 @@ fn children(fs: &dyn Storage, rel: &Path, filter: &Filter) -> Vec<Node> {
 
 /// Flattens the tree into display rows; the root is always expanded.
 pub fn flatten(root: &Node, expanded: &HashSet<PathBuf>) -> Vec<Visible> {
-    let mut out =
-        vec![Visible { path: PathBuf::new(), name: root.name.clone(), depth: 0, is_dir: true, expanded: true }];
+    let mut out = Vec::new();
     fn walk(nodes: &[Node], depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<Visible>) {
         for n in nodes {
             let open = n.is_dir && expanded.contains(&n.path);
@@ -93,7 +93,7 @@ pub fn flatten(root: &Node, expanded: &HashSet<PathBuf>) -> Vec<Visible> {
             }
         }
     }
-    walk(&root.children, 1, expanded, &mut out);
+    walk(&root.children, 0, expanded, &mut out);
     out
 }
 
@@ -149,10 +149,17 @@ mod tests {
         let tree = build(&store, &Filter { show_all: false, assets_dir: "assets" });
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("Projects"));
-        let names: Vec<_> = flatten(&tree, &expanded).into_iter().skip(1).map(|v| (v.name, v.depth)).collect();
+        let names: Vec<_> = flatten(&tree, &expanded).into_iter().map(|v| (v.name, v.depth)).collect();
         assert_eq!(
             names,
-            [("Projects".into(), 1), ("AGENTS".into(), 2), ("plan".into(), 2), ("A".into(), 1), ("b".into(), 1)]
+            [
+                ("Projects".into(), 0),
+                ("AGENTS".into(), 1),
+                ("plan".into(), 1),
+                ("A".into(), 0),
+                ("b".into(), 0),
+                ("INDEX".into(), 0)
+            ]
         );
 
         let all = build(&store, &Filter { show_all: true, assets_dir: "assets" });

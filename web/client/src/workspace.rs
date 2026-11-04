@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use gition::host::{Host, Msg, Open};
-use gition::storage::{Blob, Files, MemStorage, Storage};
+use gition::storage::{Blob, Files, MemStorage};
 use gition::sync::{self, Remote, State};
 use gition::{paste, paths};
 use serde_json::{Map, Value, json};
@@ -22,6 +22,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::github::{Api, status};
+use crate::pictures::Pictures;
 
 /// A commit and its files.
 #[derive(Clone)]
@@ -41,6 +42,7 @@ pub struct Ctx {
     pub picked: RefCell<Vec<(String, Vec<u8>)>>,
     /// Images pasted together, waiting for the app.
     pub pasted: RefCell<Vec<Pasted>>,
+    pub pictures: Pictures,
     saved_version: RefCell<u64>,
 }
 
@@ -172,6 +174,7 @@ impl Ctx {
             base: RefCell::new(base),
             picked: RefCell::new(Vec::new()),
             pasted: RefCell::new(Vec::new()),
+            pictures: Pictures::default(),
             saved_version: RefCell::new(u64::MAX),
         });
         ctx.save_blob_cache();
@@ -464,15 +467,5 @@ fn pick_file(done: impl FnOnce(String, Vec<u8>) + 'static) -> Result<(), JsValue
     input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
     on_change.forget();
     input.click();
-    Ok(())
-}
-
-/// Starter files for a repo without INDEX.md, written to the working copy.
-pub fn init_files(work: &MemStorage, title: &str, assets_dir: &str) -> Result<()> {
-    for (rel, content) in gition::repo::starter_files(title, assets_dir) {
-        if !work.exists(Path::new(&rel)) {
-            work.write(Path::new(&rel), content.as_bytes())?;
-        }
-    }
     Ok(())
 }

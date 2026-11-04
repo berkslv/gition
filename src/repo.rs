@@ -7,7 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "native")]
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 #[cfg(feature = "native")]
 use crate::git;
@@ -84,7 +84,7 @@ gition (https://github.com/berkslv/gition) in the terminal or the browser.
 
 ## Layout
 
-- `INDEX.md` (exactly this case) at the root marks the notebook and is its home page.
+- `INDEX.md` (exactly this case) at the root, if present, is the home page.
 - `name.md` is a page. A folder is a page when it holds `folder/INDEX.md`; the other `.md` files in it are its subpages.
 - Images and attachments live in `{assets_dir}/` at the root.
 - `.gition.toml` holds the settings. This file is hidden from gition's page tree.
@@ -113,34 +113,24 @@ pub fn has_index(dir: &Path) -> bool {
 }
 
 #[cfg(feature = "native")]
-/// A differently-cased index file such as `index.md`, if present.
-pub fn miscased_index(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n != INDEX && n.eq_ignore_ascii_case(INDEX)))
-}
-
-#[cfg(feature = "native")]
 pub enum Found {
     Repo(PathBuf),
-    /// No INDEX.md anywhere up the tree; this is where init should happen.
+    /// Not inside a git repo; this is where init should happen.
     NeedsInit(PathBuf),
 }
 
 #[cfg(feature = "native")]
-/// Walks up from `start` to the nearest directory holding `INDEX.md`.
-/// Falls back to the enclosing git root, then to `start` itself, for init.
+/// Walks up from `start` to the nearest directory holding `INDEX.md`, so a notebook can live
+/// in a folder of a bigger repo. Without one, the enclosing git root is the notebook.
 pub fn discover(start: &Path) -> Result<Found> {
     let start = dunce(start.canonicalize()?);
-    for dir in start.ancestors() {
-        if has_index(dir) {
-            return Ok(Found::Repo(dir.to_path_buf()));
-        }
+    if let Some(dir) = start.ancestors().find(|d| has_index(d)) {
+        return Ok(Found::Repo(dir.to_path_buf()));
     }
-    let target = git::toplevel(&start).unwrap_or(start);
-    Ok(Found::NeedsInit(target))
+    Ok(match git::toplevel(&start) {
+        Some(root) => Found::Repo(root),
+        None => Found::NeedsInit(start),
+    })
 }
 
 #[cfg(feature = "native")]
@@ -158,9 +148,6 @@ pub fn dunce(p: PathBuf) -> PathBuf {
 /// and AGENTS.md, runs
 /// `git init` if needed and commits the new files.
 pub fn init(root: &Path, assets_dir: &str) -> Result<()> {
-    if let Some(p) = miscased_index(root) {
-        bail!("found {}; rename it to {INDEX} and run gition again", p.display());
-    }
     if !git::is_repo(root) {
         git::run(root, &["init", "-q"])?;
     }

@@ -27,8 +27,9 @@ const USAGE: &str = "gition - a notebook for the terminal, stored as markdown in
 Usage: gition [PATH]
        gition [PATH] import notion [--database-as-table] EXPORT_DIR
 
-Opens the gition repo containing PATH (default: current directory).
-A gition repo is any directory with an INDEX.md; gition offers to create one.
+Opens the git repo containing PATH (default: current directory) as a notebook,
+or the nearest folder above PATH with an INDEX.md. Outside a git repo, gition
+offers to create one.
 Press ? inside gition for keys.
 
 import notion copies an unzipped Notion export (Markdown & CSV) into PATH,
@@ -163,7 +164,7 @@ fn open_repo(start: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(match repo::discover(start)? {
         Found::Repo(root) => root,
         Found::NeedsInit(dir) => {
-            print!("No INDEX.md found. Initialize gition in {}? [y/N] ", dir.display());
+            print!("Not a git repository. Initialize gition in {}? [y/N] ", dir.display());
             io::stdout().flush()?;
             let mut answer = String::new();
             io::stdin().lock().read_line(&mut answer)?;

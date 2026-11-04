@@ -170,7 +170,7 @@ impl App {
                 self.sel = i;
                 self.focus = Focus::Tree;
                 let is_dir = self.visible.get(i).is_some_and(|v| v.is_dir);
-                if is_dir && self.visible[i].expanded && !self.visible[i].path.as_os_str().is_empty() {
+                if is_dir && self.visible[i].expanded {
                     self.tree_action(Action::Collapse);
                 } else {
                     self.tree_action(Action::Open);

@@ -1,28 +1,93 @@
 //! Decoded-image and terminal-protocol cache for inline images.
-//! Paths are repo-relative. Without the `native` feature images are never
-//! shown and the viewer falls back to placeholders.
+//! Paths are repo-relative. Without the `native` feature the frontend loads the images: the
+//! viewer leaves a [`SLOT`] in the grid for each one and the frontend shows the image there.
 
 #[cfg(not(feature = "native"))]
-pub use stub::{Images, compress, compressible};
+pub use web::{Images, SLOT, compress, compressible};
 
 #[cfg(not(feature = "native"))]
-mod stub {
-    use ratatui::layout::Size;
-    use std::path::Path;
+mod web {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
 
+    use ratatui::layout::{Rect, Size};
+    use ratatui::style::Color;
+
+    /// Background of the cells an image covers. The frontend draws the image under the grid
+    /// and makes these cells transparent; a popup drawn over them resets them, and hides it.
+    pub const SLOT: Color = Color::Rgb(1, 2, 3);
+
+    /// Image sizes the frontend measured, and where the last frame showed each image.
     #[derive(Default)]
     pub struct Images {
-        _private: (),
+        /// Cell size in pixels. Images show once the frontend sets it.
+        cell: Option<(f32, f32)>,
+        /// Pixel size of each image, or `None` if it couldn't be loaded.
+        sizes: HashMap<PathBuf, Option<(u32, u32)>>,
+        /// Images the viewer asked for whose size isn't known yet, and whether the frontend was told.
+        pending: BTreeMap<PathBuf, bool>,
+        shown: Vec<(PathBuf, Rect)>,
     }
 
     impl Images {
         pub fn enabled(&self) -> bool {
-            false
+            self.cell.is_some()
         }
-        pub fn fit(&mut self, _path: &Path, _max: Size) -> Option<Size> {
-            None
+
+        /// Cell size the image takes when fitted into `max`, like `ratatui_image`'s
+        /// `Resize::Fit`: never larger than the image. `None` until the frontend loaded it.
+        pub fn fit(&mut self, path: &Path, max: Size) -> Option<Size> {
+            let (cw, ch) = self.cell?;
+            let Some(&size) = self.sizes.get(path) else {
+                self.pending.entry(path.to_path_buf()).or_default();
+                return None;
+            };
+            let (w, h) = size?;
+            let (w, h) = (w as f32, h as f32);
+            let scale = (f32::from(max.width) * cw / w).min(f32::from(max.height) * ch / h).min(1.0);
+            let cells = |px: f32, cell: f32, max: u16| ((px * scale / cell).ceil() as u16).min(max);
+            let size = Size::new(cells(w, cw, max.width), cells(h, ch, max.height));
+            (size.width > 0 && size.height > 0).then_some(size)
         }
-        pub fn forget(&mut self, _path: &Path) {}
+
+        pub fn forget(&mut self, path: &Path) {
+            self.sizes.remove(path);
+        }
+
+        /// Records where the viewer put an image this frame.
+        pub fn show(&mut self, path: &Path, area: Rect) {
+            self.shown.push((path.to_path_buf(), area));
+        }
+
+        // ---- for the frontend ----
+
+        /// Sets the cell size in pixels; true if it changed, and the page needs laying out again.
+        pub fn set_cell_size(&mut self, cell: (f32, f32)) -> bool {
+            self.cell.replace(cell) != Some(cell)
+        }
+
+        /// Images to load, each handed out once.
+        pub fn take_wanted(&mut self) -> Vec<PathBuf> {
+            self.pending
+                .iter_mut()
+                .filter(|(_, told)| !**told)
+                .map(|(p, told)| {
+                    *told = true;
+                    p.clone()
+                })
+                .collect()
+        }
+
+        /// An image's pixel size, or `None` if it can't be shown.
+        pub fn loaded(&mut self, path: PathBuf, size: Option<(u32, u32)>) {
+            self.pending.remove(&path);
+            self.sizes.insert(path, size);
+        }
+
+        /// Where the last frame showed images.
+        pub fn take_shown(&mut self) -> Vec<(PathBuf, Rect)> {
+            std::mem::take(&mut self.shown)
+        }
     }
 
     pub fn compressible(_bytes: &[u8]) -> bool {
@@ -31,6 +96,29 @@ mod stub {
 
     pub fn compress(_bytes: &[u8]) -> Option<Vec<u8>> {
         None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn fits_without_growing() {
+            let mut images = Images::default();
+            let p = Path::new("a.png");
+            assert_eq!(images.fit(p, Size::new(80, 20)), None);
+            images.set_cell_size((10.0, 20.0));
+            assert_eq!(images.fit(p, Size::new(80, 20)), None);
+            assert_eq!(images.take_wanted(), vec![p.to_path_buf()]);
+            assert!(images.take_wanted().is_empty());
+            images.loaded(p.into(), Some((200, 100)));
+            assert_eq!(images.fit(p, Size::new(80, 20)), Some(Size::new(20, 5)));
+            // Twice the pane's width: halved.
+            images.loaded(p.into(), Some((1600, 200)));
+            assert_eq!(images.fit(p, Size::new(80, 20)), Some(Size::new(80, 5)));
+            images.loaded(p.into(), None);
+            assert_eq!(images.fit(p, Size::new(80, 20)), None);
+        }
     }
 }
 

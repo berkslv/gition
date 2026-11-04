@@ -57,6 +57,22 @@ fn init_creates_files_and_commit() {
 }
 
 #[test]
+fn discover_needs_no_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = repo::dunce(tmp.path().canonicalize().unwrap());
+    let found = |start: &std::path::Path| match repo::discover(start).unwrap() {
+        repo::Found::Repo(p) => Ok(repo::dunce(p.canonicalize().unwrap())),
+        repo::Found::NeedsInit(p) => Err(p),
+    };
+    assert_eq!(found(&dir), Err(dir.clone()));
+    sh(&dir, &["init", "-q", "-b", "main"]);
+    fs::create_dir_all(dir.join("Notes/Work")).unwrap();
+    assert_eq!(found(&dir.join("Notes/Work")), Ok(dir.clone()));
+    fs::write(dir.join("Notes/INDEX.md"), "# Notes\n").unwrap();
+    assert_eq!(found(&dir.join("Notes/Work")), Ok(dir.join("Notes")));
+}
+
+#[test]
 fn sync_without_remote_commits_locally() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

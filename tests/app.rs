@@ -769,3 +769,30 @@ fn row_text(r: &gition::app::Row) -> String {
         _ => String::new(),
     }
 }
+
+#[test]
+fn opens_without_index() {
+    let files: Files = [(PathBuf::from("ideas.md"), Blob::Data(b"# Ideas\n".to_vec()))].into_iter().collect();
+    let fs = Rc::new(MemStorage::new("notes", files));
+    let host = Paster { titles: Vec::new(), fetched: Rc::default(), image: None };
+    let mut app = App::new(Box::new(fs.clone()), Box::new(host), Config::default(), Images::new(PathBuf::new(), None));
+    assert!(app.message.is_none());
+    assert_eq!(app.page.as_ref().unwrap().path, Path::new("ideas.md"));
+    // The first page is selected, not the root, so it can be deleted.
+    key(&mut app, Key::Char('d'));
+    app.on_key(Input { key: Key::Char('y'), ..Input::default() });
+    assert!(!fs.exists(Path::new("ideas.md")), "{:?}", app.message);
+}
+
+#[test]
+fn empty_notebook_has_no_rows_and_takes_new_pages() {
+    let fs = Rc::new(MemStorage::new("notes", Files::default()));
+    let host = Paster { titles: Vec::new(), fetched: Rc::default(), image: None };
+    let mut app = App::new(Box::new(fs.clone()), Box::new(host), Config::default(), Images::new(PathBuf::new(), None));
+    assert!(app.visible.is_empty() && app.page.is_none());
+    key(&mut app, Key::Char('n'));
+    typ(&mut app, "first");
+    key(&mut app, Key::Enter);
+    assert!(fs.exists(Path::new("first.md")), "{:?}", app.message);
+    assert_eq!(app.visible[0].path, Path::new("first.md"));
+}

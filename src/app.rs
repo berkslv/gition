@@ -315,7 +315,12 @@ impl App {
             rx,
         };
         app.reload_tree();
-        app.load_page(PathBuf::from(INDEX));
+        if repo::dir_has_index(&*app.fs, Path::new("")) {
+            app.load_page(PathBuf::from(INDEX));
+            app.reveal(Path::new(INDEX));
+        } else if let Some(first) = app.visible.first().filter(|v| !v.is_dir) {
+            app.load_page(first.path.clone());
+        }
         if !warnings.is_empty() {
             app.error(format!("config: {}", warnings.join("; ")));
         }
@@ -430,7 +435,8 @@ impl App {
 
     /// Expands ancestors of `path` and selects its tree node.
     fn reveal(&mut self, path: &Path) {
-        let node = if paths::is_index(path) { paths::parent(path) } else { path.to_path_buf() };
+        let parent = paths::parent(path);
+        let node = if paths::is_index(path) && !parent.as_os_str().is_empty() { parent } else { path.to_path_buf() };
         for a in node.ancestors().skip(1) {
             if !a.as_os_str().is_empty() {
                 self.expanded.insert(a.to_path_buf());
@@ -627,6 +633,11 @@ impl App {
             self.place_cursor();
         }
         self.place_cursor();
+    }
+
+    /// Lays the viewer rows out again on the next frame, as when an image's size became known.
+    pub fn relayout(&mut self) {
+        self.view.laid_out = None;
     }
 
     fn build_rows(&mut self, width: u16, height: u16) {
@@ -989,6 +1000,28 @@ impl App {
     }
 
     pub(crate) fn tree_action(&mut self, a: Action) {
+        // These work in an empty tree too.
+        match a {
+            Action::NewPage => {
+                return self.prompt("New page name", String::new(), PromptKind::NewPage(self.target_dir()));
+            }
+            Action::NewFolder => {
+                return self.prompt("New folder name", String::new(), PromptKind::NewFolder(self.target_dir()));
+            }
+            Action::InsertImage => {
+                return match self.current_markdown() {
+                    Some(page) if self.host.pick_image() => self.pending_image = Some(page),
+                    Some(page) => self.prompt("Image file to insert", String::new(), PromptKind::InsertImage(page)),
+                    None => self.error("Open a markdown page first"),
+                };
+            }
+            Action::ToggleAllFiles => {
+                self.show_all = !self.show_all;
+                self.reload_tree();
+                return self.info(if self.show_all { "Showing all files" } else { "Showing pages only" });
+            }
+            _ => {}
+        }
         let Some(node) = self.selected().cloned() else { return };
         match a {
             Action::Up => self.sel = self.sel.saturating_sub(1),
@@ -1009,7 +1042,7 @@ impl App {
                 }
             }
             Action::Collapse => {
-                if node.is_dir && node.expanded && !node.path.as_os_str().is_empty() {
+                if node.is_dir && node.expanded {
                     self.expanded.remove(&node.path);
                     self.refilter();
                 } else if let Some(i) = self.visible.iter().position(|v| v.path == paths::parent(&node.path)) {
@@ -1032,14 +1065,7 @@ impl App {
                     self.start_edit();
                 }
             }
-            Action::NewPage => self.prompt("New page name", String::new(), PromptKind::NewPage(self.target_dir())),
-            Action::NewFolder => {
-                self.prompt("New folder name", String::new(), PromptKind::NewFolder(self.target_dir()))
-            }
             Action::Rename => {
-                if node.path.as_os_str().is_empty() {
-                    return self.error("The root can't be renamed");
-                }
                 if self.editor.as_ref().is_some_and(Editor::dirty) {
                     return self.error("Save or close the editor first");
                 }
@@ -1050,9 +1076,6 @@ impl App {
                 self.prompt("Rename / move to (path from repo root)", current, PromptKind::Rename(node.path));
             }
             Action::Delete => {
-                if node.path.as_os_str().is_empty() {
-                    return self.error("The root can't be deleted");
-                }
                 let n = links::count_incoming(&*self.fs, &node.path, &tree::markdown_files(&*self.fs));
                 let what = if node.is_dir { "folder and everything in it" } else { "page" };
                 let refs = match n {
@@ -1062,16 +1085,6 @@ impl App {
                 };
                 let message = format!("Delete {what} '{}'?{refs}", paths::to_slash(&node.path));
                 self.modal = Modal::ConfirmDelete { path: node.path, message };
-            }
-            Action::InsertImage => match self.current_markdown() {
-                Some(page) if self.host.pick_image() => self.pending_image = Some(page),
-                Some(page) => self.prompt("Image file to insert", String::new(), PromptKind::InsertImage(page)),
-                None => self.error("Open a markdown page first"),
-            },
-            Action::ToggleAllFiles => {
-                self.show_all = !self.show_all;
-                self.reload_tree();
-                self.info(if self.show_all { "Showing all files" } else { "Showing pages only" });
             }
             _ => {}
         }

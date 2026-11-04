@@ -33,6 +33,8 @@
         box-sizing: border-box;
       }
       #term {
+        position: relative;
+        z-index: 1;
         flex: 1;
         min-height: 0;
         overflow: hidden;
@@ -41,6 +43,18 @@
         -webkit-user-select: none;
         user-select: none;
         -webkit-touch-callout: none;
+      }
+      /* Inline images, under the grid: their cells are transparent. */
+      #pics {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      #pics img {
+        position: absolute;
+        object-fit: contain;
+        object-position: left top;
       }
       /* Ratzilla draws each row as a <pre>; drop the browser's margins so rows touch. */
       pre {
@@ -70,6 +84,7 @@
     </style>
   </head>
   <body>
+    <div id="pics"></div>
     <div id="term"></div>
     <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
   </body>

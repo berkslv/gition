@@ -37,13 +37,13 @@ On the tag, `.github/workflows/ci.yml` checks that the tag matches the version, 
 - `update.rs`: the startup check for a newer GitHub release. `main.rs` shows it while gition runs and prints the update command on quit.
 - `scripts/`: install and update scripts, `.sh` for macOS/Linux and `.ps1` for Windows. `update.rs` prints the update script's URL, so keep the two in step.
 - `tree.rs`, `paths.rs`, `repo.rs`, `config.rs`, `keymap.rs`, `images.rs`.
-- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones.
+- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, `pictures.rs` shows inline images as `<img>`s under transparent slots the viewer leaves in the grid (`images::SLOT`), and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones, and rebuilds the grid whenever it doesn't fit the page.
 - `web/server`: the Worker. It handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie. `/auth/title` reads a page's title for signed-in users, since the browser can't across origins.
 
 ## Rules
 
 - Paths inside the app are repo-relative `PathBuf`s. Use `paths::to_slash` for links and display.
-- The repo marker is exactly `INDEX.md`, uppercase.
+- `INDEX.md` is optional. When the root has one (exactly this case), it is the home page; otherwise the notebook is the git root. A folder is a page when it holds `INDEX.md`.
 - Only the sync action (`Ctrl+G`) commits. File operations never commit.
 - Keep each file's existing line endings. New files use LF.
 - To add a key, add an entry to `actions!` in `keymap.rs` and handle it in the matching context list in `app.rs`. The help overlay reads from the keymap.
