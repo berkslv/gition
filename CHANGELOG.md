@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2
+
+### Changed
+- CI runs only on release tags, and each release deploys the web app. Pushes to main no longer deploy it.
+
+## 0.2.1
+
+### Added
+- Web: images show inline in pages, like in the terminal.
+- Any git repo opens as a notebook; an `INDEX.md` is no longer required. The root `INDEX.md` gets its own row in the tree, and new pages and folders work in an empty tree.
+- Web: Ctrl+C or quit goes back to the repo list.
+
+### Fixed
+- Web: dialogs drew off-center and the page was cut off at the right and bottom when the tab loaded in the background. The grid now rebuilds whenever it doesn't fit the page.
+
 ## 0.2.0
 
 ### Added
