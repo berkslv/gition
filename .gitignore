@@ -7,3 +7,5 @@
 /web/.dev.vars
 node_modules
 /.playwright-mcp
+.DS_Store
+/.mcp.json
