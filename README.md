@@ -2,14 +2,7 @@
 
 A Notion-style notebook for the terminal. Pages are plain markdown files in a git repo.
 
-```
-┌ Pages ─────────────┐┌ Projects/plan.md ───────────────────────┐
-│▾ notes             ││Plan                                     │
-│▾ Projects          ││                                         │
-│    plan            ││• ship v1                                │
-│  ideas             ││diagram, photo.                          │
-└────────────────────┘└─────────────────────────────────────────┘
-```
+![gition: write a page, paste a link, sync with Ctrl+G](.github/demo.gif)
 
 ## Install
 
