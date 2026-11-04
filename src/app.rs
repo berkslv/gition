@@ -8,10 +8,11 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, Widget};
 use ratatui_textarea::{CursorMove, DataCursor, Input, Key, TextArea, WrapMode};
 use web_time::Instant;
 
@@ -52,6 +53,8 @@ pub enum PageKind {
 pub struct Page {
     pub path: PathBuf,
     pub kind: PageKind,
+    /// Unique to each load, so the view knows when its rows are stale.
+    generation: u64,
 }
 
 pub struct Editor {
@@ -109,9 +112,24 @@ pub struct View {
     pub scroll: usize,
     pub cursor: usize,
     pub rows: Vec<Row>,
+    /// The 0-based source line of each row.
+    pub lines: Vec<usize>,
+    /// A source line to put the cursor on at the next layout, and its row on screen.
+    pub goto: Option<(usize, usize)>,
     pub height: u16,
     /// Where the rows were last drawn.
     pub area: Rect,
+    /// What `rows` were laid out for: the page's generation and the pane size.
+    laid_out: Option<(Option<u64>, u16, u16)>,
+    /// The first row holding an image not decoded yet because it was far from the window.
+    lazy_image: Option<usize>,
+}
+
+impl View {
+    /// Images are decoded lazily: only once their row is near the visible window.
+    fn near(&self, row: usize) -> bool {
+        row < self.scroll + self.height as usize + MAX_IMAGE_ROWS as usize
+    }
 }
 
 pub enum PromptKind {
@@ -160,6 +178,8 @@ pub enum Modal {
         lines: Vec<String>,
         scroll: usize,
     },
+    /// Background work the user waits for, such as compressing pasted images. Keys are ignored.
+    Busy(String),
     /// Actions to pick by touch (see `pointer`).
     Menu {
         items: Vec<Action>,
@@ -323,8 +343,12 @@ impl App {
     }
 
     /// Applies results from background work. Call once per loop iteration.
-    pub fn tick(&mut self) {
+    /// Handles finished background work and expires the status message.
+    /// Returns whether anything changed, so callers can skip drawing an unchanged screen.
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
+            changed = true;
             match msg {
                 Msg::Fetched(state, pulled) => {
                     self.busy = false;
@@ -350,11 +374,19 @@ impl App {
                     self.refresh_after_pull();
                     self.command_done(cmd, res);
                 }
+                Msg::Images(page, images) => {
+                    if matches!(self.modal, Modal::Busy(_)) {
+                        self.modal = Modal::None;
+                    }
+                    self.place_images(&page, images);
+                }
             }
         }
         if self.message.as_ref().is_some_and(|(_, _, t)| t.elapsed() > Duration::from_secs(5)) {
             self.message = None;
+            changed = true;
         }
+        changed
     }
 
     fn refresh_after_pull(&mut self) {
@@ -499,7 +531,9 @@ impl App {
             self.view.scroll = 0;
             self.view.cursor = 0;
         }
-        self.page = Some(Page { path, kind });
+        static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.page = Some(Page { path, kind, generation });
     }
 
     fn reload_page(&mut self) {
@@ -529,6 +563,19 @@ impl App {
         ta.set_wrap_mode(WrapMode::WordOrGlyph);
         ta.set_cursor_line_style(Style::default());
         ta.set_selection_style(self.cfg.theme.selected());
+        // Start on the line the viewer's cursor is on, at the same height on screen.
+        if let Some(&line) = self.view.lines.get(self.view.cursor) {
+            let jump = jump_to(line.min(lines.len().saturating_sub(1)), 0);
+            // The editor scrolls by wrapped rows, which it only knows once drawn, so draw it off
+            // screen in the area the viewer used.
+            let area = self.view.area;
+            (&ta).render(area, &mut Buffer::empty(area));
+            ta.move_cursor(jump);
+            let row = ta.screen_cursor().row;
+            let top = row.saturating_sub(self.view.cursor.saturating_sub(self.view.scroll));
+            ta.scroll((top.min(i16::MAX as usize) as i16 - ta.scroll_offset().0 as i16, 0));
+            ta.move_cursor(jump);
+        }
         self.editor = Some(Editor { ta, path, eol, saved: lines, titles: Vec::new(), swap: None });
         self.focus = Focus::Page;
     }
@@ -546,7 +593,11 @@ impl App {
     fn after_save_prompt(&mut self, after: After) {
         match after {
             After::ExitEdit => {
-                self.editor = None;
+                if let Some(e) = self.editor.take() {
+                    let DataCursor(line, _) = e.ta.cursor();
+                    let screen = e.ta.screen_cursor().row.saturating_sub(e.ta.scroll_offset().0 as usize);
+                    self.view.goto = Some((line, screen));
+                }
                 self.reload_page();
             }
             After::Quit => self.quit = true,
@@ -559,11 +610,30 @@ impl App {
 
     // ---- view ----------------------------------------------------------
 
-    /// Lays out the viewer rows for a pane of the given size.
+    /// Lays out the viewer rows for a pane of the given size. Wrapping a long page is the most
+    /// expensive part of a frame, so rows are only rebuilt when the page or the size changed, or
+    /// when scrolling brought an image not yet decoded near the window.
     pub fn layout(&mut self, width: u16, height: u16) {
+        self.view.height = height;
+        let key = (self.page.as_ref().map(|p| p.generation), width, height);
+        // A second pass at most: the first may scroll an image into reach.
+        for _ in 0..2 {
+            let stale = self.view.laid_out != Some(key) || self.view.lazy_image.is_some_and(|r| self.view.near(r));
+            if !stale {
+                break;
+            }
+            self.build_rows(width, height);
+            self.view.laid_out = Some(key);
+            self.place_cursor();
+        }
+        self.place_cursor();
+    }
+
+    fn build_rows(&mut self, width: u16, height: u16) {
         let App { view, page, images, .. } = self;
-        view.height = height;
         view.rows.clear();
+        view.lines.clear();
+        view.lazy_image = None;
         let Some(page) = page else { return };
         match &page.kind {
             PageKind::Markdown(blocks) => {
@@ -575,10 +645,13 @@ impl App {
                             }
                         }
                         Block::Image { dest, .. } => {
-                            // Decode lazily: only once the image is near the visible window.
-                            let near = view.rows.len() < view.scroll + height as usize + MAX_IMAGE_ROWS as usize;
-                            let fit = links::resolve(&page.path, dest)
-                                .filter(|_| near && images.enabled())
+                            let target = links::resolve(&page.path, dest).filter(|_| images.enabled());
+                            let near = view.near(view.rows.len());
+                            if target.is_some() && !near && view.lazy_image.is_none() {
+                                view.lazy_image = Some(view.rows.len());
+                            }
+                            let fit = target
+                                .filter(|_| near)
                                 .and_then(|(t, _)| images.fit(&t, Size::new(width, MAX_IMAGE_ROWS.min(height))));
                             match fit {
                                 Some(size) => {
@@ -590,18 +663,32 @@ impl App {
                             }
                         }
                     }
+                    view.lines.resize(view.rows.len(), b.src());
                 }
             }
             PageKind::Text(s) => {
-                for l in s.lines() {
+                for (n, l) in s.lines().enumerate() {
                     for w in markdown::wrap(&Line::raw(l.to_string()), 0, width) {
                         view.rows.push(Row::Text { line: w, block: None });
+                        view.lines.push(n);
                     }
                 }
             }
             _ => {}
         }
-        let h = height.max(1) as usize;
+    }
+
+    /// Applies a pending `goto`, then keeps the cursor on a row and in the window.
+    fn place_cursor(&mut self) {
+        let view = &mut self.view;
+        if let Some((line, screen)) = view.goto.take() {
+            // The first row of the last block that starts on or before `line`.
+            let start = view.lines.partition_point(|&l| l <= line).saturating_sub(1);
+            let src = view.lines.get(start).copied().unwrap_or(0);
+            view.cursor = view.lines.partition_point(|&l| l < src);
+            view.scroll = view.cursor.saturating_sub(screen);
+        }
+        let h = view.height.max(1) as usize;
         view.cursor = view.cursor.min(view.rows.len().saturating_sub(1));
         view.scroll = view.scroll.min(view.rows.len().saturating_sub(1));
         if view.cursor < view.scroll {
@@ -653,6 +740,12 @@ impl App {
     }
 
     fn open_external(&mut self, target: Open) {
+        // Links come from the repo, which may not be the user's own: never open a scheme that runs code.
+        if let Open::Url(u) = target
+            && !links::is_web_url(u)
+        {
+            return self.error(format!("Won't open {u}: only http, https and mailto links open"));
+        }
         if let Err(e) = self.host.open(target) {
             self.error(format!("Could not open: {e}"));
         }
@@ -726,7 +819,8 @@ impl App {
         if let Some(src) = paste::image_path(&s).filter(|p| p.is_file()) {
             let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let page = e.path.clone();
-            return self.insert_image_bytes(&page, &name, &std::fs::read(&src)?);
+            self.add_images(page, vec![(name, std::fs::read(&src)?)]);
+            return Ok(());
         }
         let DataCursor(row, col) = e.ta.cursor();
         let before: String = e.ta.lines()[row].chars().take(col).collect();
@@ -757,14 +851,14 @@ impl App {
         let bare = e.ta.lines().to_vec();
         let link = paste::link(&title, url);
         let DataCursor(crow, ccol) = e.ta.cursor();
-        let at = |c: usize| CursorMove::Jump(row as u16, c as u16);
+        let at = |c: usize| jump_to(row, c);
         e.ta.cancel_selection();
         e.ta.move_cursor(at(col));
         e.ta.start_selection();
         e.ta.move_cursor(at(col + len));
         e.ta.insert_str(&link);
         let ccol = if crow == row && ccol >= col + len { ccol + link.chars().count() - len } else { ccol };
-        e.ta.move_cursor(CursorMove::Jump(crow as u16, ccol as u16));
+        e.ta.move_cursor(jump_to(crow, ccol));
         // Titles for other URLs pasted later on this line moved too.
         for (_, r, c) in &mut e.titles {
             if *r == row && *c > col {
@@ -778,16 +872,8 @@ impl App {
     pub fn paste_images(&mut self, images: Vec<(&str, Vec<u8>)>) {
         let Some(page) = self.editor.as_ref().map(|e| e.path.clone()) else { return };
         let secs = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        for (i, (ext, bytes)) in images.iter().enumerate() {
-            if i > 0
-                && let Some(e) = &mut self.editor
-            {
-                e.ta.insert_newline();
-            }
-            if let Err(e) = self.insert_image_bytes(&page, &paste::image_name(ext, secs), bytes) {
-                return self.error(e.to_string());
-            }
-        }
+        let images = images.into_iter().map(|(ext, bytes)| (paste::image_name(ext, secs), bytes)).collect();
+        self.add_images(page, images);
     }
 
     pub(crate) fn global(&mut self, a: Action) {
@@ -842,7 +928,7 @@ impl App {
                 {
                     let (row, col) = if key == Key::Left { start } else { end };
                     e.ta.cancel_selection();
-                    e.ta.move_cursor(CursorMove::Jump(row as u16, col as u16));
+                    e.ta.move_cursor(jump_to(row, col));
                     return;
                 }
                 e.ta.input(k);
@@ -1033,6 +1119,7 @@ impl App {
         let ctrl = k.ctrl;
         match std::mem::replace(&mut self.modal, Modal::None) {
             Modal::Help => {}
+            busy @ Modal::Busy(_) => self.modal = busy,
             Modal::Menu { items, mut sel } => match k.key {
                 Key::Enter => {
                     if let Some(&a) = items.get(sel) {
@@ -1088,7 +1175,7 @@ impl App {
                 _ => self.modal = Modal::ConfirmDelete { path, message },
             },
             Modal::SaveChanges(after) => match k.key {
-                Key::Char('y') | Key::Char('Y') => match self.save() {
+                Key::Char('y') | Key::Char('Y') | Key::Enter => match self.save() {
                     Ok(()) => self.after_save_prompt(after),
                     Err(e) => self.error(format!("Save failed: {e}")),
                 },
@@ -1315,14 +1402,39 @@ impl App {
             bail!("Not a file: {}", src.display());
         }
         let name = src.file_name().ok_or_else(|| anyhow!("Not a file: {}", src.display()))?.to_string_lossy();
-        self.insert_image_bytes(page, &name, &std::fs::read(&src)?)
+        self.add_images(page.to_path_buf(), vec![(name.into_owned(), std::fs::read(&src)?)]);
+        Ok(())
     }
 
     /// Delivers an image picked through [`Host::pick_image`].
     pub fn insert_image_data(&mut self, name: &str, bytes: &[u8]) {
         let Some(page) = self.pending_image.take() else { return };
-        if let Err(e) = self.insert_image_bytes(&page, name, bytes) {
-            self.error(e.to_string());
+        self.add_images(page, vec![(name.to_string(), bytes.to_vec())]);
+    }
+
+    /// Adds images to `page`. With `compress_images`, images the host can compress are
+    /// compressed in the background behind a [`Modal::Busy`], and land through [`Msg::Images`].
+    fn add_images(&mut self, page: PathBuf, images: Vec<(String, Vec<u8>)>) {
+        if !self.cfg.compress_images || !images.iter().any(|(_, b)| self.host.compressible(b)) {
+            return self.place_images(&page, images);
+        }
+        let n = images.len();
+        self.modal =
+            Modal::Busy(if n == 1 { "Compressing image…".into() } else { format!("Compressing {n} images…") });
+        self.host.compress(page, images, self.tx.clone());
+    }
+
+    /// Links images from `page`, each on its own line in the editor.
+    fn place_images(&mut self, page: &Path, images: Vec<(String, Vec<u8>)>) {
+        for (i, (name, bytes)) in images.iter().enumerate() {
+            if i > 0
+                && let Some(e) = self.editor.as_mut().filter(|e| e.path == page)
+            {
+                e.ta.insert_newline();
+            }
+            if let Err(e) = self.insert_image_bytes(page, name, bytes) {
+                return self.error(e.to_string());
+            }
         }
     }
 
@@ -1369,11 +1481,18 @@ impl AsRef<str> for Labeled<'_> {
     }
 }
 
+/// A cursor jump to a data position. The editor indexes by `u16`, so positions past that saturate
+/// instead of wrapping to the top of the page.
+pub(crate) fn jump_to(row: usize, col: usize) -> CursorMove {
+    let sat = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    CursorMove::Jump(sat(row), sat(col))
+}
+
 /// Removes the cursor's line as one undoable edit and returns it with its line break.
 fn cut_line(ta: &mut TextArea) -> String {
     ta.cancel_selection();
     let DataCursor(row, _) = ta.cursor();
-    let len = |ta: &TextArea, r: usize| ta.lines()[r].chars().count() as u16;
+    let len = |ta: &TextArea, r: usize| ta.lines()[r].chars().count();
     let text = format!("{}\n", ta.lines()[row]);
     let last = row + 1 == ta.lines().len();
     // The last line takes the break before it, so no empty line is left behind.
@@ -1382,12 +1501,12 @@ fn cut_line(ta: &mut TextArea) -> String {
         (true, _) => ((row - 1, len(ta, row - 1)), (row, len(ta, row))),
         (false, _) => ((row, 0), (row + 1, 0)),
     };
-    ta.move_cursor(CursorMove::Jump(from.0 as u16, from.1));
+    ta.move_cursor(jump_to(from.0, from.1));
     ta.start_selection();
-    ta.move_cursor(CursorMove::Jump(to.0 as u16, to.1));
+    ta.move_cursor(jump_to(to.0, to.1));
     ta.cut();
     if last && row > 0 {
-        ta.move_cursor(CursorMove::Jump(row as u16 - 1, 0));
+        ta.move_cursor(jump_to(row - 1, 0));
     }
     text
 }

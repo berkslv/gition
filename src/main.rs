@@ -199,13 +199,21 @@ fn event_loop(
     newer: &mut Option<String>,
 ) -> Result<()> {
     let mut mouse = Mouse::default();
+    // Only draw when something may have changed, so an idle notebook uses no CPU.
+    let mut dirty = true;
     while !app.quit {
         if let Ok(v) = updates.try_recv() {
             app.info(format!("Update available! gition {v}. The update command is shown when you quit."));
             *newer = Some(v);
+            dirty = true;
         }
-        terminal.draw(|f| ui::draw(f, app))?;
+        if dirty {
+            terminal.draw(|f| ui::draw(f, app))?;
+            dirty = false;
+        }
         if event::poll(Duration::from_millis(100))? {
+            // Any event counts, including resizes and focus changes.
+            dirty = true;
             match event::read()? {
                 // Windows also reports key releases; only act on presses.
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(key_input(k)),
@@ -214,7 +222,7 @@ fn event_loop(
                 _ => {}
             }
         }
-        app.tick();
+        dirty |= app.tick();
     }
     Ok(())
 }

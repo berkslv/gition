@@ -2,7 +2,7 @@
 //! opening things outside gition. The terminal build uses the git CLI, the web
 //! build the GitHub API.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use anyhow::Result;
@@ -18,6 +18,8 @@ pub enum Msg {
     Title(String, Option<String>),
     /// A shell command finished: the command, its output (`Err` if it failed) and the repo state after it.
     Ran(String, Result<String, String>, State),
+    /// Images compressed for a page, as `(file name, bytes)`, ready to go under the assets dir.
+    Images(PathBuf, Vec<(String, Vec<u8>)>),
 }
 
 pub enum Open<'a> {
@@ -56,6 +58,24 @@ pub trait Host {
     fn run(&self, _cmd: &str, _tx: Sender<Msg>) -> bool {
         false
     }
+    /// Whether [`Host::compress`] would try `bytes`. Cheap.
+    fn compressible(&self, bytes: &[u8]) -> bool {
+        crate::images::compressible(bytes)
+    }
+    /// Compresses images for `page` in the background, each to lossy WebP when that's smaller,
+    /// renamed to `.webp`. Sends [`Msg::Images`].
+    fn compress(&self, page: PathBuf, images: Vec<(String, Vec<u8>)>, tx: Sender<Msg>) {
+        std::thread::spawn(move || {
+            let images = images
+                .into_iter()
+                .map(|(name, bytes)| match crate::images::compress(&bytes) {
+                    Some(webp) => (crate::paste::webp_name(&name), webp),
+                    None => (name, bytes),
+                })
+                .collect();
+            let _ = tx.send(Msg::Images(page, images));
+        });
+    }
 }
 
 /// The local git CLI on a directory.
@@ -90,7 +110,13 @@ impl Host for GitHost {
     fn open(&self, target: Open) -> Result<()> {
         match target {
             Open::Url(u) => open::that_detached(u)?,
-            Open::File(p) => open::that_detached(self.root.join(p))?,
+            Open::File(p) => {
+                let path = self.root.join(p);
+                if runs_code(&path) {
+                    anyhow::bail!("{} could run code, so gition won't open it", crate::paths::to_slash(p));
+                }
+                open::that_detached(path)?
+            }
         }
         Ok(())
     }
@@ -124,6 +150,36 @@ impl Host for GitHost {
         });
         true
     }
+}
+
+/// Whether the OS opener would run `path` rather than show it: app bundles and other directories,
+/// scripts and executables. A cloned repo can hold these and link to them from a page.
+#[cfg(feature = "native")]
+fn runs_code(path: &Path) -> bool {
+    const EXECUTABLE: &[&str] = &[
+        "app", "appimage", "bat", "cmd", "com", "command", "cpl", "desktop", "exe", "hta", "jar", "js", "jse", "lnk",
+        "msi", "pif", "pkg", "ps1", "scpt", "scr", "sh", "terminal", "tool", "url", "vbe", "vbs", "workflow", "ws",
+        "wsf",
+    ];
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.is_dir() {
+        return true;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => EXECUTABLE.iter().any(|x| ext.eq_ignore_ascii_case(x)),
+        None => is_executable(&meta),
+    }
+}
+
+#[cfg(all(feature = "native", unix))]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(all(feature = "native", not(unix)))]
+fn is_executable(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Runs `cmd` in the system shell with no input; stdout and stderr together.

@@ -14,9 +14,9 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use gition::host::{Host, Msg, Open};
-use gition::paths;
 use gition::storage::{Blob, Files, MemStorage, Storage};
 use gition::sync::{self, Remote, State};
+use gition::{paste, paths};
 use serde_json::{Map, Value, json};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -186,7 +186,9 @@ impl Ctx {
             return;
         }
         let base = self.base.borrow();
-        let changes: Map<String, Value> = sync::changed(&base.files, &self.work.files())
+        let changes: Map<String, Value> = self
+            .work
+            .with_files(|work| sync::changed(&base.files, work))
             .iter()
             .map(|(p, b)| (paths::to_slash(p), blob_json(b)))
             .collect();
@@ -212,7 +214,7 @@ impl Ctx {
     }
 
     fn changes(&self) -> usize {
-        sync::changed(&self.base.borrow().files, &self.work.files()).len()
+        self.work.with_files(|work| sync::changed(&self.base.borrow().files, work).len())
     }
 
     fn set_base(&self, snap: Snapshot, work: Option<Files>) {
@@ -367,7 +369,10 @@ impl Host for WebHost {
             }
         };
         let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
-        window.open_with_url_and_target(&url, "_blank").map_err(|e| anyhow!("{e:?}"))?;
+        // No opener, so the opened page can't navigate the gition tab elsewhere.
+        window
+            .open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer")
+            .map_err(|e| anyhow!("{e:?}"))?;
         Ok(())
     }
 
@@ -391,6 +396,52 @@ impl Host for WebHost {
             true
         })
     }
+
+    fn compressible(&self, bytes: &[u8]) -> bool {
+        paste::png_or_jpeg(bytes)
+    }
+
+    fn compress(&self, page: PathBuf, images: Vec<(String, Vec<u8>)>, tx: Sender<Msg>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut out = Vec::new();
+            for (name, bytes) in images {
+                let webp = if paste::png_or_jpeg(&bytes) { to_webp(&bytes).await } else { None };
+                out.push(match webp {
+                    Some(webp) => (paste::webp_name(&name), webp),
+                    None => (name, bytes),
+                });
+            }
+            let _ = tx.send(Msg::Images(page, out));
+        });
+    }
+}
+
+/// Lossy WebP quality, 0-1, as the native encoder's 80.
+const WEBP_QUALITY: f64 = 0.8;
+
+/// Re-encodes an image as lossy WebP with the browser's own encoder, or `None` if it can't be
+/// decoded, the browser can't write WebP (Safari gives back a PNG), or it wouldn't get smaller.
+async fn to_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+    use wasm_bindgen_futures::JsFuture;
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).ok()?;
+    // Applies a JPEG's EXIF rotation, which WebP doesn't keep.
+    let bitmap = web_sys::window()?.create_image_bitmap_with_blob(&blob).ok()?;
+    let bitmap: web_sys::ImageBitmap = JsFuture::from(bitmap).await.ok()?.unchecked_into();
+    let canvas = web_sys::OffscreenCanvas::new(bitmap.width(), bitmap.height()).ok()?;
+    let cx: web_sys::OffscreenCanvasRenderingContext2d = canvas.get_context("2d").ok()??.unchecked_into();
+    cx.draw_image_with_image_bitmap(&bitmap, 0.0, 0.0).ok()?;
+    bitmap.close();
+    let opts = web_sys::ImageEncodeOptions::new();
+    opts.set_type("image/webp");
+    opts.set_quality(WEBP_QUALITY);
+    let out = JsFuture::from(canvas.convert_to_blob_with_options(&opts).ok()?).await.ok()?;
+    let out: web_sys::Blob = out.unchecked_into();
+    if out.type_() != "image/webp" {
+        return None;
+    }
+    let webp = js_sys::Uint8Array::new(&JsFuture::from(out.array_buffer()).await.ok()?).to_vec();
+    (webp.len() < bytes.len()).then_some(webp)
 }
 
 /// Opens the browser's file chooser for an image.

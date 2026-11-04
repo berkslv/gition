@@ -169,7 +169,7 @@ fn draw_rows(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
         let highlight = if is_cursor { Style::new().bg(th.cursor) } else { Style::new() };
         let placeholder = |block: usize| {
             let (dest, alt) = match blocks.get(block) {
-                Some(Block::Image { dest, alt }) => (dest.as_str(), alt.as_str()),
+                Some(Block::Image { dest, alt, .. }) => (dest.as_str(), alt.as_str()),
                 _ => ("", ""),
             };
             let label = if alt.is_empty() { dest } else { alt };
@@ -228,6 +228,9 @@ fn status_text(app: &App) -> (String, Style) {
         return ("running…".into(), Style::new().fg(th.warning));
     }
     let Some(st) = &app.git else { return (String::new(), Style::new()) };
+    if st.changes > 0 && matches!(st.remote, Remote::Tracking { ahead: 0, behind: 0 }) {
+        return (format!("● {} changed", st.changes), Style::new().fg(th.warning));
+    }
     let (text, color) = match &st.remote {
         Remote::None => ("no remote".to_string(), th.dim),
         Remote::NoUpstream => ("not pushed yet".to_string(), th.warning),
@@ -324,7 +327,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
                 &mut hits,
                 r,
                 "Unsaved changes",
-                vec![Line::raw("Save changes?"), Line::raw(""), hint("y save · n discard · Esc cancel")],
+                vec![Line::raw("Save changes?"), Line::raw(""), hint("y or Enter save · n discard · Esc cancel")],
             );
         }
         Modal::Search { query, items, results, sel } => {
@@ -392,6 +395,10 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) -> Vec<(Rect, Target)> {
             popup(f, &th, &mut hits, r, "Keys", lines);
         }
         Modal::Command { .. } => {}
+        Modal::Busy(message) => {
+            let r = centered(area, message.width() as u16 + 6, 3);
+            popup(f, &th, &mut hits, r, "Please wait", vec![Line::raw(format!(" {message}"))]);
+        }
         Modal::Output { title, lines, scroll } => {
             let r = centered(area, 100, lines.len() as u16 + 4);
             let max = r.height.saturating_sub(4) as usize;

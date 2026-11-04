@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -74,6 +75,17 @@ impl FsStorage {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
+
+    /// Fails unless `abs`, with symlinks resolved, is inside the repo. A cloned repo can hold a
+    /// symlink to any file on the machine, and git keeps only the link, never what it points to.
+    fn check_inside(&self, abs: &Path) -> io::Result<()> {
+        let root = self.root.canonicalize()?;
+        if abs.canonicalize()?.starts_with(&root) {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "links to a file outside the repo"))
+        }
+    }
 }
 
 impl Storage for FsStorage {
@@ -81,12 +93,18 @@ impl Storage for FsStorage {
         self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into())
     }
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(self.root.join(path))
+        let abs = self.root.join(path);
+        self.check_inside(&abs)?;
+        std::fs::read(abs)
     }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         let abs = self.root.join(path);
         if let Some(dir) = abs.parent() {
             std::fs::create_dir_all(dir)?;
+            self.check_inside(dir)?;
+        }
+        if abs.symlink_metadata().is_ok() {
+            self.check_inside(&abs)?;
         }
         std::fs::write(abs, data)
     }
@@ -142,10 +160,17 @@ struct Mem {
 }
 
 impl Mem {
+    /// Files and empty directories at or below `path`. Paths order by component, so they are
+    /// one contiguous range, which keeps tree building linear in large repos.
+    fn under<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = (&'a PathBuf, bool)> + 'a {
+        let from = (Bound::Included(path), Bound::Unbounded);
+        let files = self.files.range::<Path, _>(from).map(|(p, _)| (p, false));
+        let dirs = self.dirs.range::<Path, _>(from).map(|p| (p, true));
+        files.take_while(move |(p, _)| p.starts_with(path)).chain(dirs.take_while(move |(p, _)| p.starts_with(path)))
+    }
+
     fn is_dir(&self, path: &Path) -> bool {
-        path.as_os_str().is_empty()
-            || self.dirs.iter().any(|d| d.starts_with(path))
-            || self.files.keys().any(|f| f.starts_with(path) && f != path)
+        path.as_os_str().is_empty() || self.under(path).any(|(p, is_dir)| is_dir || p != path)
     }
 
     fn touch(&mut self) {
@@ -166,6 +191,11 @@ impl MemStorage {
 
     pub fn files(&self) -> Files {
         self.mem.borrow().files.clone()
+    }
+
+    /// Runs `f` on the files without copying them, which [`MemStorage::files`] does.
+    pub fn with_files<R>(&self, f: impl FnOnce(&Files) -> R) -> R {
+        f(&self.mem.borrow().files)
     }
 
     pub fn replace(&self, files: Files) {
@@ -214,9 +244,7 @@ impl Storage for MemStorage {
             return Err(Self::not_found(path));
         }
         let mut out: BTreeMap<String, bool> = BTreeMap::new();
-        let files = m.files.keys().map(|p| (p, false));
-        let dirs = m.dirs.iter().map(|p| (p, true));
-        for (p, is_dir) in files.chain(dirs) {
+        for (p, is_dir) in m.under(path) {
             let Ok(rest) = p.strip_prefix(path) else { continue };
             let mut parts = rest.components();
             let Some(first) = parts.next() else { continue };
@@ -286,6 +314,47 @@ mod tests {
 
     fn data(s: &str) -> Blob {
         Blob::Data(s.as_bytes().to_vec())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_storage_stays_inside_the_repo() {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "secret").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let fs = FsStorage::new(repo.path().to_path_buf());
+        fs.write(Path::new("a/page.md"), b"hi").unwrap();
+        symlink(repo.path().join("a/page.md"), repo.path().join("inside.md")).unwrap();
+        symlink(&secret, repo.path().join("evil.md")).unwrap();
+        symlink(outside.path().join("missing"), repo.path().join("dangling.md")).unwrap();
+        symlink(outside.path(), repo.path().join("evil-dir")).unwrap();
+
+        assert_eq!(fs.read(Path::new("inside.md")).unwrap(), b"hi");
+        assert!(fs.read(Path::new("evil.md")).is_err());
+        assert!(fs.write(Path::new("evil.md"), b"pwned").is_err());
+        assert!(fs.write(Path::new("dangling.md"), b"pwned").is_err());
+        assert!(fs.write(Path::new("evil-dir/new.md"), b"pwned").is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
+        assert!(!outside.path().join("missing").exists() && !outside.path().join("new.md").exists());
+    }
+
+    #[test]
+    fn mem_storage_lists_only_its_own_children() {
+        let mut files = Files::new();
+        for p in ["a.md", "a/x.md", "a b/y.md", "a-z.md", "a/sub/z.md", "ab/w.md", "b.md"] {
+            files.insert(p.into(), data(p));
+        }
+        let fs = MemStorage::new("x", files);
+        fs.create_dir_all(Path::new("a/empty")).unwrap();
+        let names =
+            |p: &str| fs.read_dir(Path::new(p)).unwrap().into_iter().map(|e| (e.name, e.is_dir)).collect::<Vec<_>>();
+        assert_eq!(names("a"), [("empty".into(), true), ("sub".into(), true), ("x.md".into(), false)]);
+        assert_eq!(names("a b"), [("y.md".to_string(), false)]);
+        assert!(fs.is_dir(Path::new("a/empty")) && fs.is_dir(Path::new("ab")));
+        assert!(!fs.is_dir(Path::new("a.md")) && !fs.is_dir(Path::new("a/x.md")) && !fs.is_dir(Path::new("c")));
+        assert_eq!(names("").len(), 6);
     }
 
     #[test]

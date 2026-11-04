@@ -616,6 +616,38 @@ fn clipboard_images_go_under_assets() {
 }
 
 #[test]
+fn pasted_images_are_saved_as_webp_unless_turned_off() {
+    let img = image::RgbImage::from_fn(256, 256, |x, y| image::Rgb([x as u8, y as u8, (x ^ y) as u8]));
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+
+    // Compression runs in the background behind a popup that swallows keys.
+    let (mut app, fs, _) = paste_app(Config::default(), None);
+    app.paste_images(vec![("png", png.clone())]);
+    assert!(matches!(&app.modal, gition::app::Modal::Busy(m) if m == "Compressing image…"));
+    typ(&mut app, "x");
+    assert_eq!(first_line(&app), "# Notes ");
+    let start = std::time::Instant::now();
+    while matches!(app.modal, gition::app::Modal::Busy(_)) && start.elapsed().as_secs() < 10 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.tick();
+    }
+    assert!(matches!(app.modal, gition::app::Modal::None));
+    let line = first_line(&app);
+    let rel = line.split_once("](").unwrap().1.strip_suffix(')').unwrap();
+    assert!(rel.starts_with("assets/pasted-") && rel.ends_with(".webp"), "{line}");
+    let webp = fs.read(Path::new(rel)).unwrap();
+    assert!(webp.starts_with(b"RIFF") && webp.len() < png.len(), "{} >= {}", webp.len(), png.len());
+
+    let (mut app, fs, _) = paste_app(Config { compress_images: false, ..Config::default() }, None);
+    app.paste_images(vec![("png", png.clone())]);
+    let line = first_line(&app);
+    let rel = line.split_once("](").unwrap().1.strip_suffix(')').unwrap();
+    assert!(rel.ends_with(".png"), "{line}");
+    assert_eq!(fs.read(Path::new(rel)).unwrap(), png);
+}
+
+#[test]
 fn ctrl_x_cuts_the_line_and_ctrl_z_brings_it_back() {
     let files: Files =
         [(PathBuf::from("INDEX.md"), Blob::Data(b"# Notes\nsecond\nthird".to_vec()))].into_iter().collect();
@@ -691,4 +723,49 @@ fn an_empty_paste_pastes_the_clipboard_image() {
     assert!(line.starts_with("# Notes ![pasted-") && line.ends_with(".png)"), "{line}");
     let name = line.split_once("](").unwrap().1.trim_end_matches(')');
     assert_eq!(fs.read(Path::new(name)).unwrap(), b"\x89PNG fake");
+}
+
+#[test]
+fn switching_between_viewer_and_editor_keeps_the_cursor_line() {
+    let (_tmp, root) = workspace();
+    let long = "word ".repeat(40);
+    let body: String = (0..30).map(|i| format!("para {i}\n{long}\n\n")).collect();
+    write(&root, "long.md", &format!("# Long\n\n{body}"));
+    let mut app = App::open_dir(root, Config::default(), None);
+    select(&mut app, "long.md");
+    key(&mut app, Key::Enter);
+    render(&mut app);
+    let target = app.view.rows.iter().position(|r| r.block().is_some() && row_text(r).starts_with("para 20")).unwrap();
+    for _ in 0..target {
+        key(&mut app, Key::Down);
+        render(&mut app);
+    }
+    assert!(app.view.scroll > 0);
+
+    // "para 20" is on line 62 of the file, and stays at the same height on screen.
+    let screen = app.view.cursor - app.view.scroll;
+    key(&mut app, Key::Enter);
+    render(&mut app);
+    let e = app.editor.as_ref().unwrap();
+    assert_eq!(e.ta.cursor().0, 62);
+    assert_eq!(e.ta.screen_cursor().row - e.ta.scroll_offset().0 as usize, screen);
+
+    for _ in 0..3 {
+        key(&mut app, Key::Up);
+    }
+    render(&mut app);
+    let e = app.editor.as_ref().unwrap();
+    let screen = e.ta.screen_cursor().row - e.ta.scroll_offset().0 as usize;
+    key(&mut app, Key::Esc);
+    assert!(app.editor.is_none());
+    render(&mut app);
+    assert!(row_text(&app.view.rows[app.view.cursor]).starts_with("para 19"));
+    assert_eq!(app.view.cursor - app.view.scroll, screen);
+}
+
+fn row_text(r: &gition::app::Row) -> String {
+    match r {
+        gition::app::Row::Text { line, .. } => line.to_string(),
+        _ => String::new(),
+    }
 }

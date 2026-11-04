@@ -26,7 +26,7 @@ On the tag, `.github/workflows/ci.yml` checks that the tag matches the version, 
 - `main.rs`: arguments, repo discovery and the init prompt, the terminal loop.
 - `app.rs`: all state and key handling. Actions come from the keymap; keys are never hardcoded. Repo files go through `Storage` and sync goes through `Host`, never `std::fs` or git directly.
 - `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy.
-- `host.rs`: the `Host` trait (fetch, sync, open externally, file picker). `GitHost` is the git CLI. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
+- `host.rs`: the `Host` trait (fetch, sync, open externally, file picker, image compression). `GitHost` is the git CLI; image compression defaults to libwebp on a thread, and `WebHost` uses the browser's encoder. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
 - `ui.rs`: drawing only. Must not mutate files.
 - `pointer.rs`: touch and mouse. `ui.rs` records what it drew where (`App::hits`); taps, long presses, scrolls and swipes run the same actions as keys. A mouse drag selects text and copies it on release through `Host::copy`. The touch menu lists actions; it has no key of its own.
 - `markdown.rs`: pulldown-cmark to styled `Block`s, plus `wrap`.

@@ -29,6 +29,10 @@ struct Session {
     access_exp: Option<f64>,
     refresh: Option<String>,
     refresh_exp: Option<f64>,
+    /// When the cookie itself stops being accepted (ms since epoch). Set on every cookie written, so
+    /// a copied cookie is not good forever, even for tokens that don't expire.
+    #[serde(default)]
+    exp: Option<f64>,
 }
 
 #[event(fetch)]
@@ -98,8 +102,8 @@ async fn callback(req: &Request, url: &Url, env: &Env) -> Result<Response> {
     }
     let redirect_uri = format!("{}/auth/callback", origin(url));
     let tokens = exchange(env, &[("code", &code), ("redirect_uri", &redirect_uri)]).await?;
-    let session = session_from(&tokens)?;
-    redirect("/", &[cookie(STATE, "", 0), session_cookie(env, &session)?])
+    let mut session = session_from(&tokens)?;
+    redirect("/", &[cookie(STATE, "", 0), session_cookie(env, &mut session)?])
 }
 
 async fn token(req: &Request, env: &Env) -> Result<Response> {
@@ -120,7 +124,7 @@ async fn token(req: &Request, env: &Env) -> Result<Response> {
             Ok(tokens) => session = session_from(&tokens)?,
             Err(_) => return unauthorized(),
         }
-        set_cookie = Some(session_cookie(env, &session)?);
+        set_cookie = Some(session_cookie(env, &mut session)?);
     }
     let body = json!({
         "token": session.access,
@@ -221,6 +225,7 @@ fn session_from(v: &Value) -> Result<Session> {
         access_exp: expiry("expires_in"),
         refresh: v["refresh_token"].as_str().map(str::to_string),
         refresh_exp: expiry("refresh_token_expires_in"),
+        exp: None,
     })
 }
 
@@ -229,7 +234,11 @@ fn cipher(env: &Env) -> Result<Aes256Gcm> {
     Aes256Gcm::new_from_slice(&key).map_err(|e| Error::RustError(e.to_string()))
 }
 
-fn session_cookie(env: &Env, s: &Session) -> Result<String> {
+fn session_cookie(env: &Env, s: &mut Session) -> Result<String> {
+    // Lasts as long as the refresh token, or 30 days for tokens that don't expire.
+    let max_age =
+        s.refresh_exp.or(s.access_exp).map(|ms| ((ms - now()) / 1000.0).max(0.0) as u64).unwrap_or(30 * 86400);
+    s.exp = Some(now() + max_age as f64 * 1000.0);
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|e| Error::RustError(e.to_string()))?;
     let plain = serde_json::to_vec(s)?;
@@ -239,9 +248,6 @@ fn session_cookie(env: &Env, s: &Session) -> Result<String> {
             .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
             .map_err(|e| Error::RustError(e.to_string()))?,
     );
-    // Lasts as long as the refresh token, or 30 days for tokens that don't expire.
-    let max_age =
-        s.refresh_exp.or(s.access_exp).map(|ms| ((ms - now()) / 1000.0).max(0.0) as u64).unwrap_or(30 * 86400);
     Ok(cookie(SESSION, &B64.encode(sealed), max_age))
 }
 
@@ -253,5 +259,10 @@ fn open(env: &Env, value: &str) -> Result<Session> {
     }
     let (nonce, data) = sealed.split_at(12);
     let plain = cipher(env)?.decrypt(Nonce::from_slice(nonce), data).map_err(|_| bad())?;
-    Ok(serde_json::from_slice(&plain)?)
+    let session: Session = serde_json::from_slice(&plain)?;
+    // Cookies from before `exp` existed have none, and sign in again once.
+    if !session.exp.is_some_and(|exp| exp > now()) {
+        return Err(bad());
+    }
+    Ok(session)
 }

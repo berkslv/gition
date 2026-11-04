@@ -63,6 +63,49 @@ type Shared = Rc<RefCell<Screen>>;
 
 fn set(screen: &Shared, s: Screen) {
     *screen.borrow_mut() = s;
+    redraw();
+}
+
+thread_local! {
+    /// Whether the screen may have changed since the last frame was drawn.
+    static DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Asks for the next animation frame to draw. Drawing only then keeps an idle tab from
+/// re-laying out and re-theming every cell 60 times a second, which drains phone batteries.
+fn redraw() {
+    DIRTY.with(|d| d.set(true));
+}
+
+/// Any input may change what's on screen. Listening in the capture phase marks the frame
+/// dirty before the handlers below run, whichever of them takes the event.
+fn redraw_on_input() {
+    let w = window();
+    let mark = Closure::<dyn FnMut()>::new(redraw);
+    let options = web_sys::AddEventListenerOptions::new();
+    options.set_capture(true);
+    options.set_passive(true);
+    for name in [
+        "keydown",
+        "paste",
+        "beforeinput",
+        "pointerdown",
+        "pointermove",
+        "pointerup",
+        "pointercancel",
+        "wheel",
+        "contextmenu",
+        "hashchange",
+        "resize",
+        "focus",
+    ] {
+        let _ = w.add_event_listener_with_callback_and_add_event_listener_options(
+            name,
+            mark.as_ref().unchecked_ref(),
+            &options,
+        );
+    }
+    mark.forget();
 }
 
 fn window() -> web_sys::Window {
@@ -72,6 +115,7 @@ fn window() -> web_sys::Window {
 fn main() {
     console_error_panic_hook::set_once();
     let screen: Shared = Rc::new(RefCell::new(Screen::Message("Loading…".into())));
+    redraw_on_input();
     listen(&screen);
     spawn_local(start(screen.clone()));
     spawn_local(async move {
@@ -86,16 +130,21 @@ fn main() {
     });
 }
 
-/// Draws a frame on every animation frame, like Ratzilla's `draw_web`, but lets the DOM
-/// backend rebuild its grid first and then redraws everything when it did.
+/// Checks for changes on every animation frame, like Ratzilla's `draw_web`, but draws only
+/// when something changed. Lets the DOM backend rebuild its grid first, and then redraws
+/// everything when it did.
 fn run(mut terminal: Terminal<Grid>, screen: Shared) {
     let frame: FrameCallback = Rc::default();
     let next = frame.clone();
     *frame.borrow_mut() = Some(Closure::new(move || {
-        if terminal.backend_mut().sync() {
+        let rebuilt = terminal.backend_mut().sync();
+        if rebuilt {
             let _ = terminal.clear();
         }
-        if let Err(e) = terminal.draw(|f| draw(f, &screen)) {
+        let changed = prepare(&screen);
+        if (DIRTY.with(|d| d.replace(false)) || changed || rebuilt)
+            && let Err(e) = terminal.draw(|f| draw(f, &screen))
+        {
             web_sys::console::error_1(&e.to_string().into());
         }
         request_frame(&next);
@@ -152,8 +201,21 @@ fn set_hash(hash: &str) {
     }
 }
 
+/// A GitHub owner or repository name: letters, digits, `-`, `_` and `.`, but not `.` or `..`.
+fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 100
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 async fn open_repo(screen: &Shared, session: Session, full_name: &str) -> Result<()> {
-    let (owner, name) = full_name.split_once('/').ok_or_else(|| anyhow!("not a repository: {full_name}"))?;
+    // The name comes from the URL, and goes into API paths: no `..` or other path tricks.
+    let (owner, name) = full_name
+        .split_once('/')
+        .filter(|(o, n)| valid_name(o) && valid_name(n))
+        .ok_or_else(|| anyhow!("not a repository: {full_name}"))?;
     set(screen, Screen::Message(format!("Opening {full_name}…")));
     let api = Api::new(owner, name, session.clone());
     let branch = match api.default_branch().await {
@@ -560,6 +622,7 @@ fn listen_touch(screen: &Shared) {
                 let (x, y) = (p.x, p.y);
                 drop(gs);
                 if let Some((col, row, _)) = cell_at(x, y) {
+                    redraw();
                     with_app(&s, |app| app.long_press(col, row));
                     fit_keyboard(&s);
                 }
@@ -836,28 +899,35 @@ fn draw(f: &mut Frame, screen: &Shared) {
     }
 }
 
+/// Applies what arrived since the last frame: picked and pasted images, finished background
+/// work. Returns whether any of it changed the app.
+fn prepare(screen: &Shared) -> bool {
+    let Screen::App(app, ctx) = &mut *screen.borrow_mut() else { return false };
+    let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
+    let pasted: Vec<_> = ctx.pasted.borrow_mut().drain(..).collect();
+    let mut changed = !picked.is_empty() || !pasted.is_empty();
+    for (name, bytes) in picked {
+        app.insert_image_data(&name, &bytes);
+    }
+    for images in pasted {
+        app.paste_images(images);
+    }
+    changed |= app.tick();
+    if app.quit {
+        app.quit = false;
+        app.info("Close the tab to leave gition");
+        changed = true;
+    }
+    ctx.persist();
+    changed
+}
+
 fn draw_screen(f: &mut Frame, screen: &Shared) {
     let mut s = screen.borrow_mut();
     let hint = |t: &str| Line::styled(t.to_string(), Style::new().fg(Color::DarkGray));
     TAPS.with(|t| t.borrow_mut().clear());
     match &mut *s {
-        Screen::App(app, ctx) => {
-            let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
-            for (name, bytes) in picked {
-                app.insert_image_data(&name, &bytes);
-            }
-            let pasted: Vec<_> = ctx.pasted.borrow_mut().drain(..).collect();
-            for images in pasted {
-                app.paste_images(images);
-            }
-            app.tick();
-            if app.quit {
-                app.quit = false;
-                app.info("Close the tab to leave gition");
-            }
-            ctx.persist();
-            gition::ui::draw(f, app);
-        }
+        Screen::App(app, _) => gition::ui::draw(f, app),
         Screen::Message(m) => {
             dialog(f, "gition", vec![Line::raw(m.clone())]);
         }

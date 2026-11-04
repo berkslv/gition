@@ -15,14 +15,24 @@ pub enum Block {
         line: Line<'static>,
         links: Vec<String>,
         hang: u16,
+        /// The 0-based source line the block starts on.
+        src: usize,
     },
     Image {
         dest: String,
         alt: String,
+        src: usize,
     },
 }
 
 impl Block {
+    /// The 0-based source line the block starts on.
+    pub fn src(&self) -> usize {
+        match self {
+            Block::Text { src, .. } | Block::Image { src, .. } => *src,
+        }
+    }
+
     fn is_blank(&self) -> bool {
         matches!(self, Block::Text { line, .. } if line.spans.is_empty())
     }
@@ -41,13 +51,22 @@ struct Renderer {
     bullet: Option<String>,
     in_code: bool,
     in_meta: bool,
-    image: Option<(String, String)>,
+    image: Option<(String, String, usize)>,
+    /// Source line of the event being handled.
+    at: usize,
+    /// Source line of the first span waiting in `spans`.
+    first: Option<usize>,
 }
 
 pub fn render(src: &str, theme: &Theme) -> Vec<Block> {
     let mut r = Renderer { theme: *theme, ..Renderer::default() };
-    for ev in Parser::new_ext(src, md_options()) {
+    let breaks: Vec<usize> = src.match_indices('\n').map(|(i, _)| i).collect();
+    for (ev, range) in Parser::new_ext(src, md_options()).into_offset_iter() {
+        r.at = breaks.partition_point(|&b| b < range.start);
         r.event(ev);
+        if r.first.is_none() && (!r.spans.is_empty() || r.bullet.is_some()) {
+            r.first = Some(r.at);
+        }
     }
     r.flush();
     while r.blocks.last().is_some_and(Block::is_blank) {
@@ -85,16 +104,19 @@ impl Renderer {
         let mut spans = self.prefix();
         let hang = spans.iter().map(|s| s.content.width()).sum::<usize>() as u16;
         spans.append(&mut self.spans);
-        self.blocks.push(Block::Text { line: Line::from(spans), links: std::mem::take(&mut self.links), hang });
+        let src = self.first.take().unwrap_or(self.at);
+        self.blocks.push(Block::Text { line: Line::from(spans), links: std::mem::take(&mut self.links), hang, src });
     }
 
     fn blank(&mut self) {
         if self.blocks.last().is_some_and(|b| !b.is_blank()) {
-            self.blocks.push(Block::Text { line: Line::default(), links: Vec::new(), hang: 0 });
+            self.blocks.push(Block::Text { line: Line::default(), links: Vec::new(), hang: 0, src: self.at });
         }
     }
 
-    fn push_line(&mut self, spans: Vec<Span<'static>>) {
+    /// Pushes one finished line that starts `offset` lines into the current event.
+    fn push_line(&mut self, spans: Vec<Span<'static>>, offset: usize) {
+        self.first = Some(self.at + offset);
         self.spans = spans;
         self.flush();
     }
@@ -104,21 +126,24 @@ impl Renderer {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
-                if let Some((_, alt)) = &mut self.image {
+                if let Some((_, alt, _)) = &mut self.image {
                     alt.push_str(&t);
                 } else if self.in_meta {
                     // Front matter: one dim `key: value` line per property.
-                    for l in t.lines().filter(|l| !l.trim().is_empty()) {
+                    for (i, l) in t.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
                         let (key, value) = l.split_once(':').unwrap_or((l, ""));
-                        self.push_line(vec![
-                            Span::styled(format!("{key}: "), self.dim()),
-                            Span::raw(value.trim().trim_matches('"').to_string()),
-                        ]);
+                        self.push_line(
+                            vec![
+                                Span::styled(format!("{key}: "), self.dim()),
+                                Span::raw(value.trim().trim_matches('"').to_string()),
+                            ],
+                            i,
+                        );
                     }
                 } else if self.in_code {
                     let code = Style::new().fg(self.theme.code);
-                    for l in t.split_terminator('\n') {
-                        self.push_line(vec![Span::raw("  "), Span::styled(l.to_string(), code)]);
+                    for (i, l) in t.split_terminator('\n').enumerate() {
+                        self.push_line(vec![Span::raw("  "), Span::styled(l.to_string(), code)], i);
                     }
                 } else {
                     self.spans.push(Span::styled(t.into_string(), self.style()));
@@ -126,8 +151,8 @@ impl Renderer {
             }
             Event::Code(t) => self.spans.push(Span::styled(t.into_string(), self.style().fg(self.theme.code))),
             Event::Html(t) => {
-                for l in t.split_terminator('\n') {
-                    self.push_line(vec![Span::styled(l.to_string(), self.dim())]);
+                for (i, l) in t.split_terminator('\n').enumerate() {
+                    self.push_line(vec![Span::styled(l.to_string(), self.dim())], i);
                 }
             }
             Event::InlineHtml(t) => self.spans.push(Span::styled(t.into_string(), self.dim())),
@@ -135,7 +160,7 @@ impl Renderer {
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.flush();
-                self.push_line(vec![Span::styled("─".repeat(40), self.dim())]);
+                self.push_line(vec![Span::styled("─".repeat(40), self.dim())], 0);
                 self.blank();
             }
             Event::TaskListMarker(done) => {
@@ -199,7 +224,7 @@ impl Renderer {
             }
             Tag::Image { dest_url, .. } => {
                 self.flush();
-                self.image = Some((dest_url.into_string(), String::new()));
+                self.image = Some((dest_url.into_string(), String::new(), self.at));
             }
             Tag::Table(_) => self.flush(),
             Tag::TableHead => self.styles.push(Style::new().add_modifier(Modifier::BOLD)),
@@ -250,14 +275,14 @@ impl Renderer {
                 self.styles.pop();
             }
             TagEnd::Image => {
-                if let Some((dest, alt)) = self.image.take() {
-                    self.blocks.push(Block::Image { dest, alt });
+                if let Some((dest, alt, src)) = self.image.take() {
+                    self.blocks.push(Block::Image { dest, alt, src });
                 }
             }
             TagEnd::TableHead => {
                 self.styles.pop();
                 self.flush();
-                self.push_line(vec![Span::styled("─".repeat(40), self.dim())]);
+                self.push_line(vec![Span::styled("─".repeat(40), self.dim())], 0);
             }
             TagEnd::TableCell => self.spans.push(Span::styled(" │ ", self.dim())),
             TagEnd::TableRow => self.flush(),
@@ -339,7 +364,7 @@ mod tests {
             .iter()
             .map(|b| match b {
                 Block::Text { line, .. } => line.spans.iter().map(|s| s.content.as_ref()).collect(),
-                Block::Image { dest, alt } => format!("[img {alt} {dest}]"),
+                Block::Image { dest, alt, .. } => format!("[img {alt} {dest}]"),
             })
             .collect()
     }
@@ -348,6 +373,23 @@ mod tests {
     fn renders_front_matter_as_properties() {
         let blocks = render("---\nStatus: Done\nTitle: \"a: b\"\n---\n\n# A\n", &Theme::default());
         assert_eq!(text(&blocks), ["Status: Done", "Title: a: b", "", "A"]);
+    }
+
+    #[test]
+    fn blocks_know_their_source_line() {
+        let src =
+            "---\nStatus: Done\n---\n\n# Title\n\nsome\ntext\n\n- one\n- two\n\n![cat](c.png)\n\n```\na\nb\n```\n";
+        let blocks = render(src, &Theme::default());
+        let lines: Vec<(String, usize)> = text(&blocks).into_iter().zip(blocks.iter().map(Block::src)).collect();
+        let at = |t: &str| lines.iter().find(|(s, _)| s == t).unwrap().1;
+        assert_eq!(at("Status: Done"), 1);
+        assert_eq!(at("Title"), 4);
+        assert_eq!(at("some text"), 6);
+        assert_eq!(at("• one"), 9);
+        assert_eq!(at("• two"), 10);
+        assert_eq!(at("[img cat c.png]"), 12);
+        assert_eq!(at("  a"), 15);
+        assert_eq!(at("  b"), 16);
     }
 
     #[test]

@@ -3,10 +3,10 @@
 //! same actions a key would.
 
 use ratatui::layout::{Position, Rect};
-use ratatui_textarea::{CursorMove, Input, Key};
+use ratatui_textarea::{Input, Key};
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Editor, Focus, Modal, PageKind, Row};
+use crate::app::{App, Editor, Focus, Modal, PageKind, Row, jump_to};
 use crate::keymap::{Action, KeySpec};
 use crate::markdown::Block;
 
@@ -92,7 +92,7 @@ fn jump(ta: &mut ratatui_textarea::TextArea, area: Rect, x: u16, y: u16) {
     // Past the top or bottom edge reaches one row further, so dragging there scrolls.
     let row = if y < area.y { top.saturating_sub(1) } else { y.min(area.bottom()) - area.y + top };
     let c = ta.screen_to_data(row as usize, (x - area.x + left) as usize);
-    ta.move_cursor(CursorMove::Jump(c.0 as u16, c.1 as u16));
+    ta.move_cursor(jump_to(c.0, c.1));
 }
 
 /// The characters of `s` drawn in display columns `from..to`.

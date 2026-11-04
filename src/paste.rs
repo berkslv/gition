@@ -2,7 +2,7 @@
 //! an image path or clipboard image becomes a file under the assets dir.
 //! Pure functions, shared by the terminal app, the web app and the worker.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Extensions a pasted path must have to be imported as an image.
 pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg"];
@@ -211,6 +211,16 @@ pub fn image_name(ext: &str, unix_secs: u64) -> String {
     format!("pasted-{y:04}{m:02}{d:02}-{:02}{:02}{:02}.{ext}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
+/// `name` with its extension swapped for `.webp`, for an image compressed to WebP.
+pub fn webp_name(name: &str) -> String {
+    Path::new(name).with_extension("webp").to_string_lossy().into_owned()
+}
+
+/// Whether `bytes` start like a PNG or a JPEG, the formats worth compressing to WebP.
+pub fn png_or_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.starts_with(b"\xff\xd8\xff")
+}
+
 /// The extension for an image MIME type.
 pub fn image_ext(mime: &str) -> Option<&'static str> {
     Some(match mime.split(';').next()?.trim() {
@@ -296,5 +306,13 @@ mod tests {
         assert_eq!(image_ext("image/png"), Some("png"));
         assert_eq!(image_ext("image/svg+xml"), Some("svg"));
         assert_eq!(image_ext("text/html"), None);
+    }
+
+    #[test]
+    fn webp_targets() {
+        assert_eq!(webp_name("Screen Shot.png"), "Screen Shot.webp");
+        assert_eq!(webp_name("photo.final.jpeg"), "photo.final.webp");
+        assert!(png_or_jpeg(b"\x89PNG\r\n\x1a\n...") && png_or_jpeg(b"\xff\xd8\xff\xe0..."));
+        assert!(!png_or_jpeg(b"GIF89a") && !png_or_jpeg(b"\x89PNG one"));
     }
 }

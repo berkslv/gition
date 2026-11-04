@@ -83,6 +83,13 @@ pub fn is_local(dest: &str) -> bool {
         || dest.starts_with("mailto:"))
 }
 
+/// Whether an external link is safe to hand to a browser or the OS opener: only `http`, `https`
+/// and `mailto`. Anything else (`javascript:`, `file:`, `smb:`, app handlers) could run code.
+pub fn is_web_url(dest: &str) -> bool {
+    let Some((scheme, _)) = dest.trim().split_once(':') else { return false };
+    ["http", "https", "mailto"].iter().any(|s| scheme.eq_ignore_ascii_case(s))
+}
+
 /// Resolves a link found in repo-relative `file` to a repo-relative target path
 /// and the `#fragment`/`?query` suffix. `None` for external or escaping links.
 pub fn resolve(file: &Path, dest: &str) -> Option<(PathBuf, String)> {
@@ -150,6 +157,24 @@ pub fn count_incoming(fs: &dyn Storage, target: &Path, md_files: &[PathBuf]) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_urls() {
+        for ok in ["https://example.com", "HTTP://example.com", " http://x ", "mailto:a@b.c"] {
+            assert!(is_web_url(ok), "{ok}");
+        }
+        for bad in [
+            "javascript://%0aalert(1)",
+            "JavaScript:alert(1)",
+            "file:///etc/passwd",
+            "smb://host/share",
+            "vscode://x",
+            "notes.md",
+            "",
+        ] {
+            assert!(!is_web_url(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     #[test]

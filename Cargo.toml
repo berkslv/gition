@@ -1,6 +1,6 @@
 [package]
 name = "gition"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A Notion-style notebook for the terminal, stored as markdown in git"
 license = "MIT"
@@ -14,8 +14,9 @@ categories = ["command-line-utilities"]
 
 [features]
 default = ["native"]
-# Terminal frontend, git CLI backend and page titles over HTTP. The web build turns this off.
-native = ["dep:crossterm", "dep:image", "dep:open", "dep:ratatui-image", "dep:ureq", "ratatui/crossterm", "ratatui-textarea/crossterm"]
+# Terminal frontend, git CLI backend, page titles over HTTP and WebP image compression.
+# The web build turns this off.
+native = ["dep:crossterm", "dep:image", "dep:open", "dep:ratatui-image", "dep:ureq", "dep:webp", "ratatui/crossterm", "ratatui-textarea/crossterm"]
 
 [[bin]]
 name = "gition"
@@ -36,7 +37,17 @@ toml = "1.1.8"
 unicode-width = "0.2"
 ureq = { version = "3.5.1", optional = true }
 web-time = "1.1"
+webp = { version = "0.3.1", default-features = false, optional = true }
 
 [dev-dependencies]
 insta = "1.49.0"
 tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Image decoding and WebP encoding are unusably slow unoptimized; keep dependencies fast in dev builds.
+[profile.dev.package."*"]
+opt-level = 2

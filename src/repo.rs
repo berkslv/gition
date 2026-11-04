@@ -41,6 +41,7 @@ assets_dir = \"{assets_dir}\"
 show_all_files = false
 commit_prefix = \"gition:\"
 link_titles = true   # a pasted URL becomes [Page title](url)
+compress_images = true   # pasted PNG/JPEG images are saved as WebP
 
 [keys]
 # Action name = one key or a list of keys. Names are in src/keymap.rs.

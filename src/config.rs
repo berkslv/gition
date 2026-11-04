@@ -18,6 +18,8 @@ pub struct Config {
     pub commit_prefix: String,
     /// Pasting a bare URL in the editor turns it into a link titled after its page.
     pub link_titles: bool,
+    /// Pasted and inserted PNG/JPEG images are saved as lossy WebP when that's smaller.
+    pub compress_images: bool,
     /// Action name -> one key or a list of keys, e.g. `quit = ["q", "ctrl+q"]`.
     pub keys: BTreeMap<String, KeyList>,
     pub theme: Theme,
@@ -47,6 +49,7 @@ impl Default for Config {
             show_all_files: false,
             commit_prefix: "gition:".into(),
             link_titles: true,
+            compress_images: true,
             keys: BTreeMap::new(),
             theme: Theme::default(),
         }
@@ -266,7 +269,12 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).with_context(|| format!("invalid {FILE_NAME}"))
+        let cfg: Self = toml::from_str(text).with_context(|| format!("invalid {FILE_NAME}"))?;
+        // A cloned repo's config must not send pasted images outside the repo.
+        if crate::paths::normalize(Path::new(&cfg.assets_dir)).is_none() {
+            anyhow::bail!("invalid {FILE_NAME}: assets_dir must be a path inside the repo");
+        }
+        Ok(cfg)
     }
 }
 
@@ -289,6 +297,14 @@ mod tests {
         assert_eq!(cfg.theme.link, Color::Red);
         assert!(Config::parse("[theme]\npreset = \"nope\"\n").is_err());
         assert!(PRESETS.iter().all(|p| Theme::preset(p).is_some()));
+    }
+
+    #[test]
+    fn assets_dir_stays_in_the_repo() {
+        assert!(Config::parse("assets_dir = \"media/img\"\n").is_ok());
+        for bad in ["/tmp/x", "../outside", "a/../../b"] {
+            assert!(Config::parse(&format!("assets_dir = \"{bad}\"\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]
