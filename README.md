@@ -1,3 +1,5 @@
+<img src=".github/logo.svg" alt="" width="96" align="right" />
+
 # gition
 
 A Notion-style notebook for the terminal. Pages are plain markdown files in a git repo.
