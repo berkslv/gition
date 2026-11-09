@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- Web: repos open right away. Trees and files are cached in the browser, so a repo you've opened before loads from the cache without waiting for GitHub. Unsynced changes stay saved too.
+- Web: the first screen loads first, and the rest of the notebook downloads in the background. The status bar shows `loading pages N/M` until it's done. Opening a page that hasn't downloaded yet shows "Loading…" until it arrives.
+- Web: the gition logo is the app icon, also when it's added to the iOS home screen.
+
+### Changed
+- Moving, renaming and deleting pages wait until every page has downloaded, because they read every page to update or count links.
+
 ## 0.2.2
 
 ### Changed
