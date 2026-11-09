@@ -32,7 +32,10 @@
         flex-direction: column;
         /* Updated from visualViewport so the on-screen keyboard doesn't cover the grid. */
         height: 100dvh;
-        padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+        /* The bottom inset keeps the status bar above the home indicator. It drops to 0 while the
+           on-screen keyboard is open, since iOS keeps reporting it then. */
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+          env(safe-area-inset-left);
         box-sizing: border-box;
       }
       #term {

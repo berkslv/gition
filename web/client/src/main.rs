@@ -815,6 +815,10 @@ fn listen_touch(screen: &Shared) {
             if (vv.scale() - 1.0).abs() > 0.01 {
                 return;
             }
+            // The keyboard covers the home indicator, so no room is needed for it then.
+            let inner = w.inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(0.0);
+            let bottom = if inner - vv.height() > 100.0 { "0px" } else { "env(safe-area-inset-bottom)" };
+            let _ = body.style().set_property("padding-bottom", bottom);
             let height = format!("{}px", vv.height());
             if body.style().get_property_value("height").ok().as_deref() != Some(height.as_str()) {
                 let _ = body.style().set_property("height", &height);
