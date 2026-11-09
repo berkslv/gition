@@ -25,8 +25,8 @@ CI runs only on these tags, not on pushes to main or on PRs, so run the tests lo
 
 - `main.rs`: arguments, repo discovery and the init prompt, the terminal loop.
 - `app.rs`: all state and key handling. Actions come from the keymap; keys are never hardcoded. Repo files go through `Storage` and sync goes through `Host`, never `std::fs` or git directly.
-- `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy.
-- `host.rs`: the `Host` trait (fetch, sync, open externally, file picker, image compression). `GitHost` is the git CLI; image compression defaults to libwebp on a thread, and `WebHost` uses the browser's encoder. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
+- `storage.rs`: the `Storage` trait. `FsStorage` is a directory on disk; `MemStorage` is the web's in-memory working copy, where a file can still be downloading (`Blob::Remote`; reading it fails with `NotDownloaded`).
+- `host.rs`: the `Host` trait (fetch, sync, open externally, file picker, image compression, files still downloading). `GitHost` is the git CLI; image compression defaults to libwebp on a thread, and `WebHost` uses the browser's encoder. `sync.rs` holds the sync state, commit messages, and diff/rebase on file snapshots.
 - `ui.rs`: drawing only. Must not mutate files.
 - `pointer.rs`: touch and mouse. `ui.rs` records what it drew where (`App::hits`); taps, long presses, scrolls and swipes run the same actions as keys. A mouse drag selects text and copies it on release through `Host::copy`. The touch menu lists actions; it has no key of its own.
 - `markdown.rs`: pulldown-cmark to styled `Block`s, plus `wrap`.
@@ -37,7 +37,7 @@ CI runs only on these tags, not on pushes to main or on PRs, so run the tests lo
 - `update.rs`: the startup check for a newer GitHub release. `main.rs` shows it while gition runs and prints the update command on quit.
 - `scripts/`: install and update scripts, `.sh` for macOS/Linux and `.ps1` for Windows. `update.rs` prints the update script's URL, so keep the two in step.
 - `tree.rs`, `paths.rs`, `repo.rs`, `config.rs`, `keymap.rs`, `images.rs`.
-- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, `pictures.rs` shows inline images as `<img>`s under transparent slots the viewer leaves in the grid (`images::SLOT`), and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones, and rebuilds the grid whenever it doesn't fit the page.
+- `web/client`: the browser app (Ratzilla). `github.rs` is the API client, `workspace.rs` holds the working copy and `WebHost`, and downloads what the first screen doesn't need in the background, `cache.rs` keeps trees and blobs by sha in IndexedDB so a repo opens from it without waiting for GitHub (the saved base commit and unsynced changes stay in localStorage), `pictures.rs` shows inline images as `<img>`s under transparent slots the viewer leaves in the grid (`images::SLOT`), and `main.rs` handles sign-in, the repo picker, keyboard input and pointer gestures. It drives its own frame loop because Ratzilla's `DomBackend::size()` is wrong on phones, and rebuilds the grid whenever it doesn't fit the page.
 - `web/server`: the Worker. It handles GitHub sign-in (`/auth/*`) and keeps tokens in an encrypted cookie. `/auth/title` reads a page's title for signed-in users, since the browser can't across origins.
 
 ## Rules
@@ -45,6 +45,7 @@ CI runs only on these tags, not on pushes to main or on PRs, so run the tests lo
 - Paths inside the app are repo-relative `PathBuf`s. Use `paths::to_slash` for links and display.
 - `INDEX.md` is optional. When the root has one (exactly this case), it is the home page; otherwise the notebook is the git root. A folder is a page when it holds `INDEX.md`.
 - Only the sync action (`Ctrl+G`) commits. File operations never commit.
+- Whatever reads every page, like the link rewrites on rename and the delete warning, refuses while `Host::downloading()` is `Some`, so it never runs on part of the notebook.
 - Keep each file's existing line endings. New files use LF.
 - To add a key, add an entry to `actions!` in `keymap.rs` and handle it in the matching context list in `app.rs`. The help overlay reads from the keymap.
 - Keep the keymap small and simple. That's the point of the product.

@@ -128,6 +128,7 @@ fn draw_page(f: &mut Frame, app: &mut App, area: Rect) {
                 notice(f, format!("🖼 {} (press {label} to open)", paths::to_slash(&path)));
             }
         }
+        PageKind::Loading => notice(f, "Loading…".into()),
         PageKind::Markdown(_) | PageKind::Text(_) => draw_rows(f, app, inner, focused),
     }
 }
@@ -238,6 +239,9 @@ fn status_text(app: &App) -> (String, Style) {
     }
     if app.running {
         return ("running…".into(), Style::new().fg(th.warning));
+    }
+    if let Some((done, total)) = app.host.downloading() {
+        return (format!("loading pages {done}/{total}"), Style::new().fg(th.dim));
     }
     let Some(st) = &app.git else { return (String::new(), Style::new()) };
     if st.changes > 0 && matches!(st.remote, Remote::Tracking { ahead: 0, behind: 0 }) {

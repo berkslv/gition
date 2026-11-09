@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
@@ -14,6 +15,13 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestCache, RequestInit, Response};
 
 const API: &str = "https://api.github.com";
+
+/// Requests [`Api::texts`] keeps in flight at once. Modest, so bursts stay clear of
+/// GitHub's secondary rate limits.
+const PARALLEL: usize = 4;
+
+/// Blobs asked for in one GraphQL query.
+const BLOBS_PER_QUERY: usize = 100;
 
 /// A response with a non-2xx status.
 #[derive(Debug)]
@@ -47,7 +55,11 @@ async fn http(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&s
         req.headers().set(k, v).map_err(js)?;
     }
     let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
-    let resp: Response = JsFuture::from(window.fetch_with_request(&req)).await.map_err(js)?.unchecked_into();
+    // fetch only rejects when the request never got an answer.
+    let resp: Response = JsFuture::from(window.fetch_with_request(&req))
+        .await
+        .map_err(|_| anyhow!("can't reach GitHub, check your connection"))?
+        .unchecked_into();
     let text = JsFuture::from(resp.text().map_err(js)?).await.map_err(js)?.as_string().unwrap_or_default();
     Ok((resp.status(), text))
 }
@@ -89,6 +101,23 @@ pub struct Api {
     session: RefCell<Session>,
 }
 
+/// A commit, with the sha of its tree.
+#[derive(Debug, Clone)]
+pub struct Head {
+    pub commit: String,
+    pub tree: String,
+}
+
+impl Head {
+    /// Reads a GraphQL `target { oid ... on Commit { tree { oid } } }`.
+    fn from_target(target: &Value) -> Option<Head> {
+        Some(Head { commit: target["oid"].as_str()?.into(), tree: target["tree"]["oid"].as_str()?.into() })
+    }
+}
+
+/// The GraphQL fields [`Head::from_target`] reads.
+const TARGET: &str = "target { oid ... on Commit { tree { oid } } }";
+
 pub struct TreeEntry {
     pub path: String,
     pub mode: String,
@@ -104,6 +133,8 @@ impl Api {
         format!("{}/{}", self.owner, self.repo)
     }
 
+    /// The token, refreshed from the worker when it's about to expire. Requests that run
+    /// together may each refresh it; the borrow is never held across the wait.
     async fn token(&self) -> Result<String> {
         let expiring = self.session.borrow().expires_at.is_some_and(|t| t - now_secs() < 120.0);
         if expiring {
@@ -142,6 +173,11 @@ impl Api {
             return Err(HttpError { status, message: value["message"].as_str().unwrap_or("").into() }.into());
         }
         if let Some(err) = value["errors"].get(0) {
+            // Like REST's 404, for repos that don't exist or that the app can't see.
+            if err["type"] == "NOT_FOUND" {
+                let message = err["message"].as_str().unwrap_or("Not Found").into();
+                return Err(HttpError { status: 404, message }.into());
+            }
             bail!("GitHub: {}", err["message"].as_str().unwrap_or("GraphQL error"));
         }
         Ok(value["data"].clone())
@@ -169,18 +205,29 @@ impl Api {
         Ok(out)
     }
 
-    pub async fn default_branch(&self) -> Result<String> {
-        let repo = self.call("GET", "{repo}", None).await?;
-        Ok(repo["default_branch"].as_str().unwrap_or("main").to_string())
+    /// The default branch and its head; the head is `None` for an empty repo.
+    /// Fails with a 404 [`HttpError`] if the repo isn't there or the app can't see it.
+    pub async fn default_branch(&self) -> Result<(String, Option<Head>)> {
+        let query = format!(
+            "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ \
+             defaultBranchRef {{ name {TARGET} }} }} }}"
+        );
+        let data = self.graphql(&query, json!({ "owner": self.owner, "name": self.repo })).await?;
+        let branch = &data["repository"]["defaultBranchRef"];
+        // An empty repo has no default branch yet; it gets one with the first commit.
+        let name = branch["name"].as_str().unwrap_or("main").to_string();
+        Ok((name, Head::from_target(&branch["target"])))
     }
 
-    /// The commit a branch points to; `None` for an empty repo.
-    pub async fn branch_head(&self, branch: &str) -> Result<Option<String>> {
-        match self.call("GET", &format!("{{repo}}/git/ref/heads/{branch}"), None).await {
-            Ok(v) => Ok(v["object"]["sha"].as_str().map(str::to_string)),
-            Err(e) if status(&e) == Some(409) => Ok(None),
-            Err(e) => Err(e),
-        }
+    /// The commit a branch points to; `None` if there's no such branch, as in an empty repo.
+    pub async fn branch_head(&self, branch: &str) -> Result<Option<Head>> {
+        let query = format!(
+            "query($owner: String!, $name: String!, $ref: String!) {{ repository(owner: $owner, name: $name) {{ \
+             ref(qualifiedName: $ref) {{ {TARGET} }} }} }}"
+        );
+        let vars = json!({ "owner": self.owner, "name": self.repo, "ref": format!("refs/heads/{branch}") });
+        let data = self.graphql(&query, vars).await?;
+        Ok(Head::from_target(&data["repository"]["ref"]["target"]))
     }
 
     /// Commits `head` is behind `remote` by.
@@ -189,10 +236,16 @@ impl Api {
         Ok(v["ahead_by"].as_u64().unwrap_or(1) as usize)
     }
 
-    /// The tree of a commit: (tree sha, blob entries).
-    pub async fn tree(&self, commit: &str) -> Result<(String, Vec<TreeEntry>)> {
-        let c = self.call("GET", &format!("{{repo}}/git/commits/{commit}"), None).await?;
-        let tree = c["tree"]["sha"].as_str().ok_or_else(|| anyhow!("commit has no tree"))?.to_string();
+    /// The tree of a commit: (tree sha, blob entries). Pass `tree` when it's known,
+    /// to skip looking up the commit.
+    pub async fn tree(&self, commit: &str, tree: Option<&str>) -> Result<(String, Vec<TreeEntry>)> {
+        let tree = match tree {
+            Some(t) => t.to_string(),
+            None => {
+                let c = self.call("GET", &format!("{{repo}}/git/commits/{commit}"), None).await?;
+                c["tree"]["sha"].as_str().ok_or_else(|| anyhow!("commit has no tree"))?.to_string()
+            }
+        };
         let t = self.call("GET", &format!("{{repo}}/git/trees/{tree}?recursive=1"), None).await?;
         if t["truncated"].as_bool() == Some(true) {
             bail!("this repository is too large to open in the browser");
@@ -216,32 +269,55 @@ impl Api {
 
     /// Downloads blobs as text. Binary blobs are left out of the result.
     pub async fn texts(&self, shas: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+        let chunks: Vec<_> = stream::iter(shas.chunks(BLOBS_PER_QUERY))
+            .map(|chunk| self.text_chunk(chunk))
+            .buffer_unordered(PARALLEL)
+            .try_collect()
+            .await?;
         let mut out = HashMap::new();
-        for chunk in shas.chunks(100) {
-            let fields: String = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, sha)| {
-                    format!("b{i}: object(oid: \"{sha}\") {{ ... on Blob {{ text isBinary isTruncated }} }}\n")
-                })
-                .collect();
-            let query = format!(
-                "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}"
-            );
-            let data = self.graphql(&query, json!({ "owner": self.owner, "name": self.repo })).await?;
-            for (i, sha) in chunk.iter().enumerate() {
-                let b = &data["repository"][format!("b{i}")];
-                if b["isBinary"].as_bool() != Some(false) {
-                    continue;
-                }
-                if b["isTruncated"].as_bool() == Some(true) {
-                    out.insert(sha.clone(), self.blob(sha).await?);
-                } else if let Some(t) = b["text"].as_str() {
-                    out.insert(sha.clone(), t.as_bytes().to_vec());
-                }
+        let mut truncated = Vec::new();
+        for (texts, big) in chunks {
+            out.extend(texts);
+            truncated.extend(big);
+        }
+        // GraphQL cuts long texts short; the REST API has them whole.
+        let big: Vec<_> = stream::iter(truncated)
+            .map(|sha| async move {
+                let data = self.blob(&sha).await?;
+                Ok::<_, anyhow::Error>((sha, data))
+            })
+            .buffer_unordered(PARALLEL)
+            .try_collect()
+            .await?;
+        out.extend(big);
+        Ok(out)
+    }
+
+    /// One GraphQL query's worth of [`Api::texts`]: the texts, and the shas of truncated ones.
+    async fn text_chunk(&self, chunk: &[String]) -> Result<(HashMap<String, Vec<u8>>, Vec<String>)> {
+        let fields: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, sha)| format!("b{i}: object(oid: \"{sha}\") {{ ... on Blob {{ text isBinary isTruncated }} }}\n"))
+            .collect();
+        let query = format!(
+            "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}"
+        );
+        let data = self.graphql(&query, json!({ "owner": self.owner, "name": self.repo })).await?;
+        let mut texts = HashMap::new();
+        let mut truncated = Vec::new();
+        for (i, sha) in chunk.iter().enumerate() {
+            let b = &data["repository"][format!("b{i}")];
+            if b["isBinary"].as_bool() != Some(false) {
+                continue;
+            }
+            if b["isTruncated"].as_bool() == Some(true) {
+                truncated.push(sha.clone());
+            } else if let Some(t) = b["text"].as_str() {
+                texts.insert(sha.clone(), t.as_bytes().to_vec());
             }
         }
-        Ok(out)
+        Ok((texts, truncated))
     }
 
     pub async fn blob(&self, sha: &str) -> Result<Vec<u8>> {

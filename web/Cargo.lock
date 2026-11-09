@@ -516,6 +516,7 @@ dependencies = [
  "anyhow",
  "base64",
  "console_error_panic_hook",
+ "futures-util",
  "gition",
  "js-sys",
  "ratatui-textarea",

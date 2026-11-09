@@ -1,6 +1,7 @@
 //! gition in the browser: the same app and UI as the terminal build, drawn with
 //! Ratzilla, with a GitHub repo as storage.
 
+mod cache;
 mod github;
 mod pictures;
 mod workspace;
@@ -37,7 +38,7 @@ use web_sys::{
 
 use crate::github::{Api, Session, status};
 use crate::pictures::Pictures;
-use crate::workspace::{Ctx, WebHost, get_item, set_item};
+use crate::workspace::{Ctx, Local, WebHost, get_item, set_item};
 
 const LAST_REPO: &str = "gition:last";
 
@@ -165,10 +166,6 @@ fn request_frame(f: &FrameCallback) {
 
 async fn start(screen: Shared) {
     let result: Result<()> = async {
-        let Some(session) = github::session().await? else {
-            set(&screen, Screen::Login);
-            return Ok(());
-        };
         let hash = window().location().hash().unwrap_or_default();
         let hash = hash.trim_start_matches('#');
         let repo = if hash == "repos" {
@@ -176,10 +173,22 @@ async fn start(screen: Shared) {
         } else if hash.contains('/') {
             Some(hash.to_string())
         } else {
-            get_item(LAST_REPO)
+            get_item(LAST_REPO).filter(|r| !r.is_empty())
+        };
+        // Read what we kept of the repo while the worker looks up the token.
+        let local = async {
+            match &repo {
+                Some(r) => Some(Local::load(r).await),
+                None => None,
+            }
+        };
+        let (session, local) = futures_util::future::join(github::session(), local).await;
+        let Some(session) = session? else {
+            set(&screen, Screen::Login);
+            return Ok(());
         };
         match repo {
-            Some(r) => open_repo(&screen, session, &r).await,
+            Some(r) => open_repo(&screen, session, &r, local).await,
             None => show_repos(&screen, session).await,
         }
     }
@@ -211,15 +220,31 @@ fn valid_name(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-async fn open_repo(screen: &Shared, session: Session, full_name: &str) -> Result<()> {
+/// Opens a repo. `local` is what [`Local::load`] gave for it, if it's been read already.
+async fn open_repo(screen: &Shared, session: Session, full_name: &str, local: Option<Local>) -> Result<()> {
     // The name comes from the URL, and goes into API paths: no `..` or other path tricks.
     let (owner, name) = full_name
         .split_once('/')
         .filter(|(o, n)| valid_name(o) && valid_name(n))
         .ok_or_else(|| anyhow!("not a repository: {full_name}"))?;
     set(screen, Screen::Message(format!("Opening {full_name}…")));
+    let mut local = match local {
+        Some(l) => l,
+        None => Local::load(full_name).await,
+    };
     let api = Api::new(owner, name, session.clone());
-    let branch = match api.default_branch().await {
+    // Show what we had last time right away; the app's first fetch catches up with GitHub,
+    // and reports errors like lost access there. Only the first screen's files that the
+    // cache lacks are downloaded first; if that fails, those pages say so when opened.
+    if let Some((branch, base)) = local.cached.take() {
+        set_hash(full_name);
+        set_item(LAST_REPO, full_name);
+        let ctx = Ctx::new(api, branch, base, local);
+        let _ = ctx.load_first().await;
+        start_app(screen, ctx);
+        return Ok(());
+    }
+    let (branch, head) = match api.default_branch().await {
         Err(e) if status(&e) == Some(404) => {
             set_item(LAST_REPO, "");
             return show_repos(screen, session).await;
@@ -228,11 +253,11 @@ async fn open_repo(screen: &Shared, session: Session, full_name: &str) -> Result
     };
     set_hash(full_name);
     set_item(LAST_REPO, full_name);
-    let Some(head) = api.branch_head(&branch).await? else {
+    let Some(head) = head else {
         set(screen, Screen::Empty { session, full_name: full_name.into() });
         return Ok(());
     };
-    let ctx = Ctx::open(api, branch, head).await?;
+    let ctx = Ctx::open(api, branch, head, local).await?;
     start_app(screen, ctx);
     Ok(())
 }
@@ -251,6 +276,7 @@ fn start_app(screen: &Shared, ctx: Rc<Ctx>) {
     }
     app.touch = touch();
     app.start_fetch();
+    ctx.fill_in_background();
     set(screen, Screen::App(Box::new(app), ctx));
 }
 
@@ -390,7 +416,7 @@ fn handle(screen: &Shared, input: Input) -> bool {
             let _ = window().open_with_url_and_target(&url, "_blank");
         }
         Then::Open(session, name) => spawn_local(async move {
-            if let Err(e) = open_repo(&screen, session, &name).await {
+            if let Err(e) = open_repo(&screen, session, &name, None).await {
                 set(&screen, Screen::Error(format!("{e:#}")));
             }
         }),
@@ -405,7 +431,7 @@ fn handle(screen: &Shared, input: Input) -> bool {
                 let api = Api::new(owner, repo_name, session.clone());
                 let (path, content) = repo::starter_files(repo_name, &Config::default().assets_dir).remove(0);
                 api.create_file(&path, &content, "gition: init").await?;
-                open_repo(&screen, session, &name).await
+                open_repo(&screen, session, &name, None).await
             }
             .await;
             if let Err(e) = res {

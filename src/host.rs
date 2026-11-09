@@ -20,6 +20,9 @@ pub enum Msg {
     Ran(String, Result<String, String>, State),
     /// Images compressed for a page, as `(file name, bytes)`, ready to go under the assets dir.
     Images(PathBuf, Vec<(String, Vec<u8>)>),
+    /// Files asked for with [`Host::want`], or downloading in the background, arrived; or
+    /// the download failed with this error.
+    Downloaded(Option<String>),
 }
 
 pub enum Open<'a> {
@@ -57,6 +60,17 @@ pub trait Host {
     /// False if the host can't run commands.
     fn run(&self, _cmd: &str, _tx: Sender<Msg>) -> bool {
         false
+    }
+    /// Downloads a file the storage doesn't have yet (reading it fails with
+    /// [`crate::storage::NotDownloaded`]) ahead of the others, and sends [`Msg::Downloaded`].
+    /// False if it won't come as text, as for a binary file.
+    fn want(&self, _path: &Path, _tx: Sender<Msg>) -> bool {
+        false
+    }
+    /// Files still downloading in the background, as (done, total), or `None` when the storage
+    /// has them all. Until then, whatever reads every page would only see some of them.
+    fn downloading(&self) -> Option<(usize, usize)> {
+        None
     }
     /// Whether [`Host::compress`] would try `bytes`. Cheap.
     fn compressible(&self, bytes: &[u8]) -> bool {

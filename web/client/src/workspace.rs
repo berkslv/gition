@@ -3,9 +3,16 @@
 //! `base` is the last commit we know of; `work` is the editable copy. Ctrl+S
 //! writes to `work` (persisted in localStorage), Ctrl+G commits the difference
 //! with the Git Data API and fast-forwards the branch.
+//!
+//! File contents and trees are kept in the [`Cache`]. When it has the base commit's
+//! tree, a repo opens without waiting for GitHub, and the first fetch catches up.
+//!
+//! A repo opens once the first screen's files are here (see [`first_screen`]); the
+//! rest download in the background, and stay [`Blob::Remote`] until they do. A page
+//! opened before then is downloaded first ([`Host::want`]).
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -13,15 +20,18 @@ use std::sync::mpsc::Sender;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use gition::config::FILE_NAME;
 use gition::host::{Host, Msg, Open};
-use gition::storage::{Blob, Files, MemStorage};
+use gition::repo::INDEX;
+use gition::storage::{self, Blob, Files, MemStorage};
 use gition::sync::{self, Remote, State};
 use gition::{paste, paths};
 use serde_json::{Map, Value, json};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::github::{Api, status};
+use crate::cache::{Cache, Tree};
+use crate::github::{Api, Head, TreeEntry, status};
 use crate::pictures::Pictures;
 
 /// A commit and its files.
@@ -43,7 +53,47 @@ pub struct Ctx {
     /// Images pasted together, waiting for the app.
     pub pasted: RefCell<Vec<Pasted>>,
     pub pictures: Pictures,
+    pub cache: Cache,
     saved_version: RefCell<u64>,
+    /// Blobs that aren't text, which stay remote.
+    binary: RefCell<HashSet<String>>,
+    /// Blobs asked for with [`Host::want`] and downloading.
+    wanted: RefCell<HashSet<String>>,
+    /// The background download is running.
+    filling: Cell<bool>,
+    /// Text blobs downloaded since opening, and still to download.
+    done: Cell<usize>,
+    remaining: Cell<usize>,
+    /// Where to tell the app that downloads arrived.
+    tx: RefCell<Option<Sender<Msg>>>,
+}
+
+/// Text blobs downloaded in one go in the background.
+const BATCH: usize = 300;
+
+/// At most this many files are downloaded before a repo opens.
+const FIRST_SCREEN: usize = 100;
+
+/// After a failed background batch, waits this long before retrying, doubling up to `RETRY_MAX_MS`.
+const RETRY_MS: i32 = 5_000;
+const RETRY_MAX_MS: i32 = 60_000;
+
+/// Resolves after `ms` milliseconds.
+async fn sleep(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Files downloaded before a repo opens, so the first screen is complete: pages at the root
+/// and one folder down, and other files at the root. [`Ctx::load_first`] takes the config
+/// and the home page before them.
+fn first_screen(p: &Path) -> bool {
+    let depth = p.components().count();
+    depth == 1 || (depth == 2 && paths::is_markdown(p))
 }
 
 /// Images from one paste, as (extension, bytes).
@@ -69,28 +119,156 @@ pub fn set_item(key: &str, value: &str) -> bool {
     local_storage().is_some_and(|s| s.set_item(key, value).is_ok())
 }
 
-/// Loads a commit's files. Text blobs are downloaded unless `known` (by git sha)
-/// has them; images stay remote.
-pub async fn load_snapshot(api: &Api, commit: &str, known: &HashMap<String, Vec<u8>>) -> Result<Snapshot> {
-    let (tree, entries) = api.tree(commit).await?;
-    let wanted: Vec<String> = entries
-        .iter()
-        .filter(|e| !paths::is_image(Path::new(&e.path)) && !known.contains_key(&e.sha))
-        .map(|e| e.sha.clone())
-        .collect();
-    let fetched = api.texts(&wanted).await?;
+/// Builds a commit's snapshot from its tree, taking file contents from `blob` (by git sha).
+/// Files it doesn't have stay remote.
+fn snapshot(commit: &str, (tree, entries): Tree, blob: impl Fn(&str) -> Option<Vec<u8>>) -> Snapshot {
     let mut files = Files::new();
     let mut modes = HashMap::new();
     for e in entries {
         let path = PathBuf::from(&e.path);
-        let blob = match known.get(&e.sha).or_else(|| fetched.get(&e.sha)) {
-            Some(data) => Blob::Data(data.clone()),
-            None => Blob::Remote(e.sha.clone()),
+        let blob = match blob(&e.sha) {
+            Some(data) => Blob::Data(data),
+            None => Blob::Remote(e.sha),
         };
         files.insert(path.clone(), blob);
         modes.insert(path, e.mode);
     }
-    Ok(Snapshot { commit: commit.into(), tree, files, modes })
+    Snapshot { commit: commit.into(), tree, files, modes }
+}
+
+/// The entries that are loaded as text: all but images.
+fn text_entries(entries: &[TreeEntry]) -> impl Iterator<Item = &TreeEntry> {
+    entries.iter().filter(|e| !paths::is_image(Path::new(&e.path)))
+}
+
+/// Builds a commit's snapshot from the cache alone, with the files it has; `None` without the tree.
+async fn cached_snapshot(cache: &Cache, commit: &str) -> Option<Snapshot> {
+    let tree = cache.tree(commit).await?;
+    let wanted: Vec<String> = text_entries(&tree.1).map(|e| e.sha.clone()).collect();
+    let found = cache.blobs(&wanted).await;
+    Some(snapshot(commit, tree, |sha| found.get(sha).cloned().flatten()))
+}
+
+/// Loads a commit's files. `tree` is the commit's tree sha, if known. Text blobs come
+/// from `known` (by git sha), then the cache, then GitHub for those at paths `download`
+/// picks; the rest stay remote, as do images. What GitHub sends goes into the cache.
+pub async fn load_snapshot(
+    api: &Api,
+    cache: &Cache,
+    commit: &str,
+    tree: Option<&str>,
+    known: &HashMap<String, Vec<u8>>,
+    download: impl Fn(&Path) -> bool,
+) -> Result<Snapshot> {
+    let tree = match cache.tree(commit).await {
+        Some(t) => t,
+        None => {
+            let (tree, entries) = api.tree(commit, tree).await?;
+            cache.put_tree(commit, &tree, &entries);
+            (tree, entries)
+        }
+    };
+    let wanted: Vec<String> =
+        text_entries(&tree.1).map(|e| &e.sha).filter(|s| !known.contains_key(*s)).cloned().collect();
+    let mut found = cache.blobs(&wanted).await;
+    let mut missing: Vec<String> = text_entries(&tree.1)
+        .filter(|e| download(Path::new(&e.path)) && !known.contains_key(&e.sha) && !found.contains_key(&e.sha))
+        .map(|e| e.sha.clone())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    let fetched = if missing.is_empty() { HashMap::new() } else { api.texts(&missing).await? };
+    // Blobs GitHub didn't send as text are binary.
+    cache.put_blobs(missing.iter().map(|s| (s.as_str(), fetched.get(s).map(Vec::as_slice))));
+    found.extend(fetched.into_iter().map(|(sha, data)| (sha, Some(data))));
+    Ok(snapshot(commit, tree, |sha| known.get(sha).cloned().or_else(|| found.get(sha).cloned().flatten())))
+}
+
+/// Saves a commit made here to the cache: its tree, and the files that changed.
+fn cache_commit(cache: &Cache, snap: &Snapshot, changed: &BTreeMap<PathBuf, Option<Blob>>) {
+    let entries: Vec<TreeEntry> = snap
+        .files
+        .iter()
+        .map(|(p, b)| TreeEntry {
+            path: paths::to_slash(p),
+            mode: snap.modes.get(p).cloned().unwrap_or_else(|| "100644".into()),
+            sha: match b {
+                Blob::Data(d) => git_sha(d),
+                Blob::Remote(sha) => sha.clone(),
+            },
+        })
+        .collect();
+    cache.put_tree(&snap.commit, &snap.tree, &entries);
+    let data: Vec<(String, &[u8])> = changed
+        .values()
+        .filter_map(|b| match b {
+            Some(Blob::Data(d)) => Some((git_sha(d), d.as_slice())),
+            _ => None,
+        })
+        .collect();
+    cache.put_blobs(data.iter().map(|(sha, d)| (sha.as_str(), Some(*d))));
+}
+
+/// Makes `base` and `work` agree where one has a file's content and the other only its sha,
+/// as when a download landed while `base` was being built, so that isn't seen as a change.
+/// Hashes only those files.
+fn settle(base: &mut Files, work: &MemStorage) {
+    let mut into_work = HashMap::new();
+    work.with_files(|w| {
+        for (p, b) in base.iter_mut() {
+            match (&*b, w.get(p)) {
+                (Blob::Remote(sha), Some(Blob::Data(d))) if git_sha(d) == *sha => *b = Blob::Data(d.clone()),
+                (Blob::Data(d), Some(Blob::Remote(sha))) if git_sha(d) == *sha => {
+                    into_work.insert(sha.clone(), d.clone());
+                }
+                _ => {}
+            }
+        }
+    });
+    work.fill(&into_work);
+}
+
+/// What this browser kept of a repo: the saved state (base commit and unsynced changes),
+/// and, when the cache has its tree, the base commit's files.
+pub struct Local {
+    pub cache: Cache,
+    saved: Value,
+    /// The saved branch and its base snapshot, built without the network.
+    pub cached: Option<(String, Snapshot)>,
+}
+
+fn state_key(full_name: &str) -> String {
+    format!("gition:repo:{full_name}")
+}
+
+impl Local {
+    pub async fn load(full_name: &str) -> Local {
+        forget_old_blob_caches();
+        let cache = Cache::open().await;
+        let saved: Value =
+            get_item(&state_key(full_name)).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+        let cached = match (saved["branch"].as_str(), saved["head"].as_str()) {
+            (Some(branch), Some(head)) => cached_snapshot(&cache, head).await.map(|s| (branch.to_string(), s)),
+            _ => None,
+        };
+        Local { cache, saved, cached }
+    }
+
+    /// The saved state, if it's for `branch`.
+    fn saved(&self, branch: &str) -> Option<&Value> {
+        (self.saved["branch"].as_str() == Some(branch)).then_some(&self.saved)
+    }
+}
+
+/// Removes the blob caches older versions kept in localStorage, to give its quota back.
+fn forget_old_blob_caches() {
+    let Some(storage) = local_storage() else { return };
+    let len = storage.length().unwrap_or(0);
+    let old: Vec<String> =
+        (0..len).filter_map(|i| storage.key(i).ok()?).filter(|k| k.starts_with("gition:blobs:")).collect();
+    for k in old {
+        let _ = storage.remove_item(&k);
+    }
 }
 
 fn known_blobs(files: &[&Files]) -> HashMap<String, Vec<u8>> {
@@ -130,35 +308,31 @@ fn json_blob(v: &Value) -> Option<Option<Blob>> {
 }
 
 impl Ctx {
-    fn state_key(&self) -> String {
-        format!("gition:repo:{}", self.api.full_name())
-    }
-
-    fn blobs_key(&self) -> String {
-        format!("gition:blobs:{}", self.api.full_name())
-    }
-
-    /// Opens a repo: the last base commit we saw (or the branch head) plus unsynced local changes.
-    pub async fn open(api: Api, branch: String, head: String) -> Result<Rc<Ctx>> {
-        let key = format!("gition:repo:{}", api.full_name());
-        let saved: Value = get_item(&key).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-        let saved = if saved["branch"].as_str() == Some(&branch) { saved } else { Value::Null };
-        let base_commit = saved["head"].as_str().unwrap_or(&head).to_string();
-
-        let cached: HashMap<String, Vec<u8>> = get_item(&format!("gition:blobs:{}", api.full_name()))
-            .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, v.into_bytes()))
-            .collect();
-        let base = match load_snapshot(&api, &base_commit, &cached).await {
-            Ok(s) => s,
-            // The saved commit may be gone after a force-push; start from the head.
-            Err(e) if base_commit != head && status(&e) == Some(404) => load_snapshot(&api, &head, &cached).await?,
-            Err(e) => return Err(e),
+    /// Opens a repo at `branch`: the last base commit we saw (or `head`) plus unsynced local changes.
+    pub async fn open(api: Api, branch: String, head: Head, local: Local) -> Result<Rc<Ctx>> {
+        let saved = local.saved(&branch).and_then(|s| s["head"].as_str()).filter(|c| *c != head.commit);
+        let none = HashMap::new();
+        let later = |_: &Path| false;
+        let base = match saved {
+            None => load_snapshot(&api, &local.cache, &head.commit, Some(&head.tree), &none, later).await?,
+            Some(commit) => match load_snapshot(&api, &local.cache, commit, None, &none, later).await {
+                Ok(s) => s,
+                // The saved commit may be gone after a force-push; start from the head.
+                Err(e) if status(&e) == Some(404) => {
+                    load_snapshot(&api, &local.cache, &head.commit, Some(&head.tree), &none, later).await?
+                }
+                Err(e) => return Err(e),
+            },
         };
+        let ctx = Ctx::new(api, branch, base, local);
+        ctx.load_first().await?;
+        Ok(ctx)
+    }
+
+    /// Opens a repo at `base`, with the unsynced local changes saved for `branch`.
+    pub fn new(api: Api, branch: String, mut base: Snapshot, local: Local) -> Rc<Ctx> {
         let mut work = base.files.clone();
-        if let Some(changes) = saved["changes"].as_object() {
+        if let Some(changes) = local.saved(&branch).and_then(|s| s["changes"].as_object()) {
             for (p, v) in changes {
                 match json_blob(v) {
                     Some(Some(b)) => work.insert(PathBuf::from(p), b),
@@ -167,19 +341,142 @@ impl Ctx {
                 };
             }
         }
+        let work = Rc::new(MemStorage::new(api.repo.clone(), work));
+        settle(&mut base.files, &work);
         let ctx = Rc::new(Ctx {
-            work: Rc::new(MemStorage::new(api.repo.clone(), work)),
+            work,
             api,
             branch,
             base: RefCell::new(base),
             picked: RefCell::new(Vec::new()),
             pasted: RefCell::new(Vec::new()),
             pictures: Pictures::default(),
+            cache: local.cache,
             saved_version: RefCell::new(u64::MAX),
+            binary: RefCell::default(),
+            wanted: RefCell::default(),
+            filling: Cell::new(false),
+            done: Cell::new(0),
+            remaining: Cell::new(0),
+            tx: RefCell::new(None),
         });
-        ctx.save_blob_cache();
+        ctx.recount();
         ctx.persist();
-        Ok(ctx)
+        ctx
+    }
+
+    /// Text blobs not downloaded yet at paths `pick` picks, in path order.
+    fn missing(&self, pick: impl Fn(&Path) -> bool) -> Vec<String> {
+        let binary = self.binary.borrow();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut add = |files: &Files| {
+            for (p, b) in files {
+                if let Blob::Remote(sha) = b
+                    && !paths::is_image(p)
+                    && !binary.contains(sha)
+                    && pick(p)
+                    && seen.insert(sha.clone())
+                {
+                    out.push(sha.clone());
+                }
+            }
+        };
+        add(&self.base.borrow().files);
+        self.work.with_files(|w| add(w));
+        out
+    }
+
+    fn recount(&self) {
+        self.remaining.set(self.missing(|_| true).len());
+    }
+
+    /// Downloads text blobs, from the cache or GitHub, into the base and the working copy.
+    /// Files written, moved or deleted since keep what they have now.
+    async fn download(&self, shas: &[String]) -> Result<()> {
+        if shas.is_empty() {
+            return Ok(());
+        }
+        let cached = self.cache.blobs(shas).await;
+        let missing: Vec<String> = shas.iter().filter(|s| !cached.contains_key(*s)).cloned().collect();
+        let mut blobs = if missing.is_empty() { HashMap::new() } else { self.api.texts(&missing).await? };
+        // Blobs GitHub didn't send as text are binary.
+        self.cache.put_blobs(missing.iter().map(|s| (s.as_str(), blobs.get(s).map(Vec::as_slice))));
+        let mut binary: Vec<String> = missing.into_iter().filter(|s| !blobs.contains_key(s)).collect();
+        for (sha, data) in cached {
+            match data {
+                Some(d) => {
+                    blobs.insert(sha, d);
+                }
+                None => binary.push(sha),
+            }
+        }
+        self.binary.borrow_mut().extend(binary);
+        storage::fill(&mut self.base.borrow_mut().files, &blobs);
+        self.work.fill(&blobs);
+        let before = self.remaining.get();
+        self.recount();
+        self.done.set(self.done.get() + before.saturating_sub(self.remaining.get()));
+        Ok(())
+    }
+
+    /// Downloads what the first screen shows: the config, the home page, then the
+    /// [`first_screen`] files.
+    pub async fn load_first(&self) -> Result<()> {
+        let mut first = self.missing(|p| p == Path::new(FILE_NAME) || p == Path::new(INDEX));
+        for sha in self.missing(first_screen) {
+            if first.len() >= FIRST_SCREEN {
+                break;
+            }
+            if !first.contains(&sha) {
+                first.push(sha);
+            }
+        }
+        self.download(&first).await
+    }
+
+    /// Downloads the remaining text files in the background, a batch at a time, telling the
+    /// app after each. After an error it reports once and retries with a growing delay, so
+    /// going offline doesn't leave pages half loaded. Files are filled in by sha, so it doesn't
+    /// matter if the base moves meanwhile.
+    pub fn fill_in_background(self: &Rc<Self>) {
+        if self.filling.replace(true) {
+            return;
+        }
+        let ctx = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut retry = RETRY_MS;
+            loop {
+                let missing = ctx.missing(|_| true);
+                if missing.is_empty() {
+                    // Files deleted or rewritten before they arrived count as done too.
+                    if ctx.remaining.replace(0) > 0 {
+                        ctx.notify(None);
+                    }
+                    break;
+                }
+                match ctx.download(&missing[..missing.len().min(BATCH)]).await {
+                    Ok(()) => {
+                        retry = RETRY_MS;
+                        ctx.notify(None);
+                    }
+                    Err(e) => {
+                        if retry == RETRY_MS {
+                            ctx.notify(Some(e));
+                        }
+                        sleep(retry).await;
+                        retry = (retry * 2).min(RETRY_MAX_MS);
+                    }
+                }
+            }
+            ctx.filling.set(false);
+        });
+    }
+
+    fn notify(&self, err: Option<anyhow::Error>) {
+        if let Some(tx) = &*self.tx.borrow() {
+            let _ = tx.send(Msg::Downloaded(err.map(|e| e.to_string())));
+        }
     }
 
     /// Saves the base commit and local changes, if anything changed since last time.
@@ -196,37 +493,23 @@ impl Ctx {
             .map(|(p, b)| (paths::to_slash(p), blob_json(b)))
             .collect();
         let state = json!({ "branch": self.branch, "head": base.commit, "changes": changes });
-        if set_item(&self.state_key(), &state.to_string()) {
+        if set_item(&state_key(&self.api.full_name()), &state.to_string()) {
             *self.saved_version.borrow_mut() = version;
         }
-    }
-
-    /// Caches the base's text files by git sha so reloads only fetch the tree.
-    fn save_blob_cache(&self) {
-        let base = self.base.borrow();
-        let texts: HashMap<String, &str> = base
-            .files
-            .values()
-            .filter_map(|b| match b {
-                Blob::Data(d) => Some((git_sha(d), std::str::from_utf8(d).ok()?)),
-                Blob::Remote(_) => None,
-            })
-            .collect();
-        // Best effort: a full localStorage only costs a slower reload.
-        set_item(&self.blobs_key(), &serde_json::to_string(&texts).unwrap_or_default());
     }
 
     fn changes(&self) -> usize {
         self.work.with_files(|work| sync::changed(&self.base.borrow().files, work).len())
     }
 
-    fn set_base(&self, snap: Snapshot, work: Option<Files>) {
+    fn set_base(&self, mut snap: Snapshot, work: Option<Files>) {
         if let Some(w) = work {
             self.work.replace(w);
         }
+        settle(&mut snap.files, &self.work);
         *self.base.borrow_mut() = snap;
+        self.recount();
         *self.saved_version.borrow_mut() = u64::MAX;
-        self.save_blob_cache();
         self.persist();
     }
 
@@ -241,16 +524,20 @@ impl Ctx {
             Err(e) => return (State { remote: Remote::Offline(e.to_string()), changes: self.changes() }, 0),
         };
         let head = self.base.borrow().commit.clone();
-        if remote == head {
+        if remote.commit == head {
             return (self.state(0), 0);
         }
-        let behind = self.api.behind_by(&head, &remote).await.unwrap_or(1);
+        let behind = self.api.behind_by(&head, &remote.commit);
         if self.changes() > 0 {
-            return (self.state(behind), 0);
+            return (self.state(behind.await.unwrap_or(1)), 0);
         }
         let version = self.work.version();
         let known = known_blobs(&[&self.base.borrow().files]);
-        match load_snapshot(&self.api, &remote, &known).await {
+        // New files download in the background, like when opening.
+        let snap = load_snapshot(&self.api, &self.cache, &remote.commit, Some(&remote.tree), &known, |_| false);
+        let (behind, snap) = futures_util::future::join(behind, snap).await;
+        let behind = behind.unwrap_or(1);
+        match snap {
             // Only fast-forward if nothing was edited while downloading.
             Ok(snap) if self.work.version() == version && self.changes() == 0 => {
                 let files = snap.files.clone();
@@ -263,10 +550,16 @@ impl Ctx {
     }
 
     /// Moves the base to `remote`, replaying local changes on top (see [`sync::rebase`]).
-    async fn rebase(&self, remote: &str) -> Result<()> {
+    /// Waits for the background download: [`sync::rebase`] compares content, and a file here
+    /// only by sha but downloaded for `remote` would look changed upstream.
+    async fn rebase(&self, remote: &Head) -> Result<()> {
+        self.recount();
+        if self.remaining.get() > 0 {
+            bail!("Still downloading pages, sync again in a moment");
+        }
         let version = self.work.version();
         let known = known_blobs(&[&self.base.borrow().files, &self.work.files()]);
-        let snap = load_snapshot(&self.api, remote, &known).await?;
+        let snap = load_snapshot(&self.api, &self.cache, &remote.commit, Some(&remote.tree), &known, |_| true).await?;
         if self.work.version() != version {
             bail!("Files changed during sync, press sync again");
         }
@@ -281,13 +574,14 @@ impl Ctx {
     async fn sync(&self, prefix: &str) -> Result<String> {
         for _ in 0..3 {
             let remote = self.api.branch_head(&self.branch).await?.ok_or_else(|| anyhow!("the branch is gone"))?;
-            let pulled = remote != self.base.borrow().commit;
+            let pulled = remote.commit != self.base.borrow().commit;
             if pulled {
                 self.rebase(&remote).await?;
             }
             let base = self.base.borrow().clone();
             let work = self.work.files();
             let changes = sync::diff(&base.files, &work);
+            let changed = sync::changed(&base.files, &work);
             if changes.is_empty() {
                 return Ok(if pulled {
                     "Pulled, nothing to commit".into()
@@ -297,12 +591,12 @@ impl Ctx {
             }
             let mut entries = Vec::new();
             let mut modes = base.modes.clone();
-            for (p, blob) in sync::changed(&base.files, &work) {
-                let path = paths::to_slash(&p);
-                let mode = modes.get(&p).cloned().unwrap_or_else(|| "100644".into());
-                let entry = match &blob {
+            for (p, blob) in &changed {
+                let path = paths::to_slash(p);
+                let mode = modes.get(p).cloned().unwrap_or_else(|| "100644".into());
+                let entry = match blob {
                     None => {
-                        modes.remove(&p);
+                        modes.remove(p);
                         json!({ "path": path, "mode": mode, "type": "blob", "sha": null })
                     }
                     Some(Blob::Remote(sha)) => json!({ "path": path, "mode": mode, "type": "blob", "sha": sha }),
@@ -315,7 +609,7 @@ impl Ctx {
                     },
                 };
                 if blob.is_some() {
-                    modes.insert(p, mode);
+                    modes.insert(p.clone(), mode);
                 }
                 entries.push(entry);
             }
@@ -324,7 +618,9 @@ impl Ctx {
             let commit = self.api.create_commit(&message, &tree, &base.commit).await?;
             match self.api.update_branch(&self.branch, &commit).await {
                 Ok(()) => {
-                    self.set_base(Snapshot { commit, tree, files: work, modes }, None);
+                    let snap = Snapshot { commit, tree, files: work, modes };
+                    cache_commit(&self.cache, &snap, &changed);
+                    self.set_base(snap, None);
                     return Ok(format!("Synced, {}", sync::committed(changes.len())));
                 }
                 // Someone pushed in between: rebase and try again.
@@ -342,14 +638,17 @@ pub struct WebHost(pub Rc<Ctx>);
 impl Host for WebHost {
     fn fetch(&self, tx: Sender<Msg>) {
         let ctx = self.0.clone();
+        *ctx.tx.borrow_mut() = Some(tx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let (state, pulled) = ctx.fetch().await;
             let _ = tx.send(Msg::Fetched(state, pulled));
+            ctx.fill_in_background();
         });
     }
 
     fn sync(&self, commit_prefix: &str, tx: Sender<Msg>) {
         let ctx = self.0.clone();
+        ctx.fill_in_background();
         let prefix = commit_prefix.to_string();
         wasm_bindgen_futures::spawn_local(async move {
             let res = ctx.sync(&prefix).await.map_err(|e| e.to_string());
@@ -360,6 +659,29 @@ impl Host for WebHost {
 
     fn changes(&self) -> usize {
         self.0.changes()
+    }
+
+    fn want(&self, path: &Path, tx: Sender<Msg>) -> bool {
+        let ctx = self.0.clone();
+        *ctx.tx.borrow_mut() = Some(tx);
+        let sha = match ctx.work.with_files(|f| f.get(path).cloned()) {
+            Some(Blob::Remote(sha)) if !paths::is_image(path) && !ctx.binary.borrow().contains(&sha) => sha,
+            _ => return false,
+        };
+        ctx.fill_in_background();
+        if ctx.wanted.borrow_mut().insert(sha.clone()) {
+            wasm_bindgen_futures::spawn_local(async move {
+                let res = ctx.download(std::slice::from_ref(&sha)).await;
+                ctx.wanted.borrow_mut().remove(&sha);
+                ctx.notify(res.err());
+            });
+        }
+        true
+    }
+
+    fn downloading(&self) -> Option<(usize, usize)> {
+        let (done, remaining) = (self.0.done.get(), self.0.remaining.get());
+        (remaining > 0).then_some((done, done + remaining))
     }
 
     fn open(&self, target: Open) -> Result<()> {

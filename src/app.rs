@@ -26,7 +26,7 @@ use crate::paste;
 use crate::paths;
 use crate::pointer::{Selection, Target};
 use crate::repo::{self, INDEX};
-use crate::storage::Storage;
+use crate::storage::{self, Storage};
 use crate::sync::State;
 use crate::tree::{self, Filter, Node, Visible};
 
@@ -34,6 +34,8 @@ use crate::tree::{self, Filter, Node, Visible};
 const MAX_IMAGE_ROWS: u16 = 20;
 /// Below this terminal width the tree hides unless toggled on.
 const NARROW_WIDTH: u16 = 70;
+/// Said when something needs every page while the host is still downloading some.
+const STILL_DOWNLOADING: &str = "Still downloading pages, try again in a moment";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -48,6 +50,8 @@ pub enum PageKind {
     Binary,
     /// A folder without INDEX.md.
     Folder,
+    /// A file the host is still downloading (see [`Host::want`]).
+    Loading,
 }
 
 pub struct Page {
@@ -385,6 +389,12 @@ impl App {
                     }
                     self.place_images(&page, images);
                 }
+                Msg::Downloaded(Some(e)) => self.error(format!("Download failed: {e}")),
+                Msg::Downloaded(None) => {
+                    if self.page.as_ref().is_some_and(|p| matches!(p.kind, PageKind::Loading)) {
+                        self.reload_page();
+                    }
+                }
             }
         }
         if self.message.as_ref().is_some_and(|(_, _, t)| t.elapsed() > Duration::from_secs(5)) {
@@ -526,6 +536,14 @@ impl App {
                     Err(_) => PageKind::Binary,
                 },
                 Ok(_) => PageKind::Binary,
+                // Not here yet: ask for it first, and show it when it arrives.
+                Err(e) if storage::not_downloaded(&e) => {
+                    if self.host.want(&path, self.tx.clone()) {
+                        PageKind::Loading
+                    } else {
+                        PageKind::Binary
+                    }
+                }
                 Err(e) => {
                     self.error(format!("{}: {e}", paths::to_slash(&path)));
                     return;
@@ -555,12 +573,19 @@ impl App {
 
     fn start_edit(&mut self) {
         let Some(page) = &self.page else { return };
+        if matches!(page.kind, PageKind::Loading) {
+            return self.info("Still downloading this page, try again in a moment");
+        }
         if !matches!(page.kind, PageKind::Markdown(_) | PageKind::Text(_)) {
             return self.error("This file can't be edited here");
         }
         let path = page.path.clone();
+        // Never an empty editor for content that isn't here: saving it would overwrite the page.
         let content = match self.fs.read_to_string(&path) {
             Ok(c) => c,
+            Err(e) if storage::not_downloaded(&e) => {
+                return self.info("Still downloading this page, try again in a moment");
+            }
             Err(e) => return self.error(e.to_string()),
         };
         let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
@@ -1069,6 +1094,10 @@ impl App {
                 if self.editor.as_ref().is_some_and(Editor::dirty) {
                     return self.error("Save or close the editor first");
                 }
+                // Moving rewrites links in every page, so it needs them all.
+                if self.host.downloading().is_some() {
+                    return self.info(STILL_DOWNLOADING);
+                }
                 let mut current = paths::to_slash(&node.path);
                 if !node.is_dir && !self.show_all && paths::is_markdown(&node.path) {
                     current.truncate(current.len() - 3);
@@ -1076,6 +1105,10 @@ impl App {
                 self.prompt("Rename / move to (path from repo root)", current, PromptKind::Rename(node.path));
             }
             Action::Delete => {
+                // The warning counts links in every page.
+                if self.host.downloading().is_some() {
+                    return self.info(STILL_DOWNLOADING);
+                }
                 let n = links::count_incoming(&*self.fs, &node.path, &tree::markdown_files(&*self.fs));
                 let what = if node.is_dir { "folder and everything in it" } else { "page" };
                 let refs = match n {
@@ -1365,6 +1398,9 @@ impl App {
         let case_only = paths::to_slash(new).to_lowercase() == paths::to_slash(old).to_lowercase();
         if self.fs.exists(new) && !case_only {
             bail!("'{}' already exists", paths::to_slash(new));
+        }
+        if self.host.downloading().is_some() {
+            bail!(STILL_DOWNLOADING);
         }
         let mut edits = Vec::new();
         for f in tree::markdown_files(&*self.fs) {

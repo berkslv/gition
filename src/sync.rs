@@ -163,4 +163,29 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn files_not_downloaded_count_by_sha() {
+        let d = |s: &str| Blob::Data(s.as_bytes().to_vec());
+        let r = |s: &str| Blob::Remote(s.into());
+        let files =
+            |list: Vec<(&str, Blob)>| -> Files { list.into_iter().map(|(p, b)| (PathBuf::from(p), b)).collect() };
+        let base = files(vec![("a.md", r("sa")), ("b.md", r("sb")), ("c.md", r("sc")), ("d.md", d("d"))]);
+        // a.md untouched, b.md moved, c.md edited.
+        let ours = files(vec![("a.md", r("sa")), ("x/b.md", r("sb")), ("c.md", d("c-ours")), ("d.md", d("d"))]);
+        assert_eq!(
+            changed(&base, &ours),
+            [("b.md".into(), None), ("c.md".into(), Some(d("c-ours"))), ("x/b.md".into(), Some(r("sb")))].into()
+        );
+        assert_eq!(commit_message("", &diff(&base, &ours)), "rename b.md -> x/b.md, edit c.md");
+
+        // Upstream changed a.md, still not downloaded here, and d.md: theirs win, no conflict.
+        let theirs = files(vec![("a.md", d("a-theirs")), ("b.md", r("sb")), ("c.md", r("sc")), ("d.md", r("sd2"))]);
+        let (merged, conflicts) = rebase(&base, &ours, &theirs);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(
+            merged,
+            files(vec![("a.md", d("a-theirs")), ("c.md", d("c-ours")), ("d.md", r("sd2")), ("x/b.md", r("sb"))])
+        );
+    }
 }

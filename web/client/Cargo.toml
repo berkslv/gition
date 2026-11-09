@@ -9,6 +9,7 @@ publish.workspace = true
 anyhow = "1.0.104"
 base64 = "0.22"
 console_error_panic_hook = "0.1.7"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 gition = { path = "../..", default-features = false }
 js-sys = "0.3"
 ratatui-textarea = { version = "0.9.4", default-features = false }
@@ -30,6 +31,7 @@ web-sys = { version = "0.3", features = [
     "Element",
     "DomRect",
     "Document",
+    "DomStringList",
     "Event",
     "EventTarget",
     "File",
@@ -41,6 +43,13 @@ web-sys = { version = "0.3", features = [
     "HtmlImageElement",
     "HtmlTextAreaElement",
     "HtmlInputElement",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
     "ImageBitmap",
     "ImageEncodeOptions",
     "InputEvent",
@@ -58,6 +67,7 @@ web-sys = { version = "0.3", features = [
     "RequestInit",
     "Response",
     "Storage",
+    "StorageManager",
     "Url",
     "VisualViewport",
     "Window",

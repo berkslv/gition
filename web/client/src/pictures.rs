@@ -47,7 +47,7 @@ impl Pictures {
         Some((sha, blob))
     }
 
-    /// Loads an image, downloading it first if it's still on GitHub.
+    /// Loads an image, from the cache or GitHub if it isn't here yet.
     pub fn want(ctx: &Rc<Ctx>, path: PathBuf) {
         let pics = &ctx.pictures;
         let Some((sha, blob)) = Self::blob(ctx, &path) else {
@@ -62,7 +62,16 @@ impl Pictures {
         wasm_bindgen_futures::spawn_local(async move {
             let bytes = match blob {
                 Blob::Data(d) => Some(d),
-                Blob::Remote(sha) => ctx.api.blob(&sha).await.ok(),
+                Blob::Remote(sha) => match ctx.cache.blob(&sha).await {
+                    Some(b) => Some(b),
+                    None => {
+                        let b = ctx.api.blob(&sha).await.ok();
+                        if let Some(b) = &b {
+                            ctx.cache.put_blobs([(sha.as_str(), Some(b.as_slice()))]);
+                        }
+                        b
+                    }
+                },
             };
             let loaded = match bytes {
                 Some(b) => load(&b).await,

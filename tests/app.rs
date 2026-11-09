@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use gition::app::{App, Focus};
+use gition::app::{App, Focus, PageKind};
 use gition::config::Config;
 use gition::host::{Host, Msg, Open};
 use gition::images::Images;
@@ -795,4 +795,91 @@ fn empty_notebook_has_no_rows_and_takes_new_pages() {
     key(&mut app, Key::Enter);
     assert!(fs.exists(Path::new("first.md")), "{:?}", app.message);
     assert_eq!(app.visible[0].path, Path::new("first.md"));
+}
+
+/// A host still downloading some files, like the web build right after opening a repo.
+#[derive(Default)]
+struct Downloading {
+    wanted: RefCell<Vec<PathBuf>>,
+    tx: RefCell<Option<Sender<Msg>>>,
+    done: std::cell::Cell<bool>,
+}
+
+struct DownloadingHost(Rc<Downloading>);
+
+impl Host for DownloadingHost {
+    fn fetch(&self, _tx: Sender<Msg>) {}
+    fn sync(&self, _prefix: &str, _tx: Sender<Msg>) {}
+    fn changes(&self) -> usize {
+        0
+    }
+    fn open(&self, _target: Open) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn want(&self, path: &Path, tx: Sender<Msg>) -> bool {
+        self.0.wanted.borrow_mut().push(path.to_path_buf());
+        *self.0.tx.borrow_mut() = Some(tx);
+        path.extension().is_some_and(|e| e == "md")
+    }
+    fn downloading(&self) -> Option<(usize, usize)> {
+        (!self.0.done.get()).then_some((1, 3))
+    }
+}
+
+#[test]
+fn pages_still_downloading_load_when_they_arrive() {
+    let files: Files = [
+        ("INDEX.md", Blob::Data(b"# Notes\n\n[later](later.md)\n".to_vec())),
+        ("later.md", Blob::Remote("s1".into())),
+        ("file.pdf", Blob::Remote("s2".into())),
+    ]
+    .into_iter()
+    .map(|(p, b)| (PathBuf::from(p), b))
+    .collect();
+    let fs = Rc::new(MemStorage::new("notes", files));
+    let host = Rc::new(Downloading::default());
+    let cfg = Config { show_all_files: true, ..Config::default() };
+    let mut app =
+        App::new(Box::new(fs.clone()), Box::new(DownloadingHost(host.clone())), cfg, Images::new(PathBuf::new(), None));
+    fn kind(app: &App) -> &PageKind {
+        &app.page.as_ref().unwrap().kind
+    }
+
+    // A binary file never comes as text.
+    select(&mut app, "file.pdf");
+    key(&mut app, Key::Enter);
+    assert!(matches!(kind(&app), PageKind::Binary));
+
+    app.focus = Focus::Tree;
+    select(&mut app, "later.md");
+    key(&mut app, Key::Enter);
+    assert!(matches!(kind(&app), PageKind::Loading));
+    assert_eq!(*host.wanted.borrow(), [PathBuf::from("file.pdf"), PathBuf::from("later.md")]);
+    let screen = format!("{:?}", render(&mut app).backend());
+    assert!(screen.contains("Loading…") && screen.contains("loading pages 1/3"), "{screen}");
+
+    // No editor on content that isn't here; saving it would overwrite the page.
+    key(&mut app, Key::Char('e'));
+    assert!(app.editor.is_none());
+
+    // Moving and deleting need every page, for their links.
+    app.focus = Focus::Tree;
+    key(&mut app, Key::Char('r'));
+    assert!(matches!(app.modal, gition::app::Modal::None));
+    key(&mut app, Key::Char('d'));
+    assert!(matches!(app.modal, gition::app::Modal::None));
+    assert!(app.message.as_ref().unwrap().0.starts_with("Still downloading"));
+
+    // The content arrives.
+    let blobs = [("s1".to_string(), b"# Later\n".to_vec())].into_iter().collect();
+    let version = fs.version();
+    assert_eq!(fs.fill(&blobs), 1);
+    assert_eq!(fs.version(), version);
+    host.done.set(true);
+    host.tx.borrow().as_ref().unwrap().send(Msg::Downloaded(None)).unwrap();
+    assert!(app.tick());
+    assert!(matches!(kind(&app), PageKind::Markdown(_)));
+    app.focus = Focus::Page;
+    key(&mut app, Key::Char('e'));
+    assert!(app.editor.is_some());
 }

@@ -4,7 +4,7 @@
 //! All paths are repo-relative; the empty path is the root.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -151,6 +151,38 @@ pub enum Blob {
 
 pub type Files = BTreeMap<PathBuf, Blob>;
 
+/// What [`MemStorage::read`] fails with for a file it hasn't downloaded yet.
+#[derive(Debug)]
+pub struct NotDownloaded;
+
+impl std::fmt::Display for NotDownloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("still downloading")
+    }
+}
+
+impl std::error::Error for NotDownloaded {}
+
+/// Whether a read failed only because the file isn't downloaded yet.
+pub fn not_downloaded(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<NotDownloaded>())
+}
+
+/// Puts downloaded content (by git blob sha) in place of the [`Blob::Remote`]s it belongs to.
+/// Any other file is left alone, as one written since. Returns how many files it filled.
+pub fn fill(files: &mut Files, blobs: &HashMap<String, Vec<u8>>) -> usize {
+    let mut n = 0;
+    for blob in files.values_mut() {
+        if let Blob::Remote(sha) = blob
+            && let Some(data) = blobs.get(sha)
+        {
+            *blob = Blob::Data(data.clone());
+            n += 1;
+        }
+    }
+    n
+}
+
 #[derive(Default)]
 struct Mem {
     files: Files,
@@ -205,6 +237,12 @@ impl MemStorage {
         m.touch();
     }
 
+    /// [`fill`]s in downloaded content. Not a write: the content is what was there, so the
+    /// version stays.
+    pub fn fill(&self, blobs: &HashMap<String, Vec<u8>>) -> usize {
+        fill(&mut self.mem.borrow_mut().files, blobs)
+    }
+
     /// Changes with every write, so callers can tell when to persist.
     pub fn version(&self) -> u64 {
         self.mem.borrow().version
@@ -223,7 +261,7 @@ impl Storage for MemStorage {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         match self.mem.borrow().files.get(path) {
             Some(Blob::Data(d)) => Ok(d.clone()),
-            Some(Blob::Remote(_)) => Err(io::Error::other("not downloaded")),
+            Some(Blob::Remote(_)) => Err(io::Error::other(NotDownloaded)),
             None => Err(Self::not_found(path)),
         }
     }
@@ -372,7 +410,8 @@ mod tests {
             [("INDEX.md".to_string(), false), ("Projects".to_string(), true), ("assets".to_string(), true)]
         );
         assert!(fs.is_dir(Path::new("Projects")));
-        assert!(fs.read(Path::new("assets/x.png")).is_err());
+        assert!(not_downloaded(&fs.read(Path::new("assets/x.png")).unwrap_err()));
+        assert!(!not_downloaded(&fs.read(Path::new("missing.md")).unwrap_err()));
 
         fs.rename(Path::new("Projects"), Path::new("Archive/Old")).unwrap();
         assert_eq!(fs.read_to_string(Path::new("Archive/Old/plan.md")).unwrap(), "plan");
@@ -383,5 +422,33 @@ mod tests {
         fs.remove(Path::new("Archive")).unwrap();
         assert!(!fs.exists(Path::new("Archive/Old/plan.md")));
         assert!(fs.write(Path::new("Empty"), b"x").is_err());
+    }
+
+    #[test]
+    fn mem_storage_fills_only_what_is_still_remote() {
+        let mut files = Files::new();
+        for p in ["a.md", "b.md", "c.md", "d.md", "same.md"] {
+            files.insert(p.into(), Blob::Remote(format!("sha-{p}")));
+        }
+        files.insert("same.md".into(), Blob::Remote("sha-a.md".into()));
+        files.insert("e.md".into(), Blob::Remote("other".into()));
+        let fs = MemStorage::new("x", files);
+        // Since the download started: b.md edited, c.md moved, d.md deleted.
+        fs.write(Path::new("b.md"), b"mine").unwrap();
+        fs.rename(Path::new("c.md"), Path::new("moved/c.md")).unwrap();
+        fs.remove(Path::new("d.md")).unwrap();
+        let version = fs.version();
+
+        let blobs: HashMap<String, Vec<u8>> =
+            ["a.md", "b.md", "c.md", "d.md"].iter().map(|p| (format!("sha-{p}"), p.as_bytes().to_vec())).collect();
+        assert_eq!(fs.fill(&blobs), 3);
+        assert_eq!(fs.version(), version, "filling isn't an edit");
+        assert_eq!(fs.read_to_string(Path::new("a.md")).unwrap(), "a.md");
+        assert_eq!(fs.read_to_string(Path::new("same.md")).unwrap(), "a.md");
+        assert_eq!(fs.read_to_string(Path::new("b.md")).unwrap(), "mine");
+        assert_eq!(fs.read_to_string(Path::new("moved/c.md")).unwrap(), "c.md");
+        assert!(!fs.exists(Path::new("d.md")));
+        assert!(not_downloaded(&fs.read(Path::new("e.md")).unwrap_err()));
+        assert_eq!(fs.fill(&blobs), 0);
     }
 }
