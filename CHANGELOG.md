@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+- Web: on iPhones, the home indicator no longer covers the status bar at the bottom of the screen.
+
 ## 0.3.0
 
 ### Added
