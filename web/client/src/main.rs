@@ -24,7 +24,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{ClipboardEvent, Event, KeyboardEvent, MouseEvent};
 
 use crate::dom::{closest, data, set_html, window};
-use crate::github::{Api, Session, status};
+use crate::github::{Api, Installed, Session, status};
 use crate::notebook::Notebook;
 use crate::workspace::{Ctx, Local, get_item, set_item};
 
@@ -40,6 +40,12 @@ pub fn theme() -> String {
 pub fn set_theme(theme: &str) {
     set_item(THEME, theme);
     apply_theme();
+}
+
+/// Ends the session with the worker, which clears its cookie and comes back to the sign-in screen.
+/// What this browser keeps of each repo, unsynced changes included, stays for the next sign-in.
+pub fn sign_out() {
+    let _ = window().location().assign("/auth/logout");
 }
 
 fn apply_theme() {
@@ -67,7 +73,9 @@ enum Screen {
     Login,
     Repos {
         session: Session,
-        repos: Vec<String>,
+        repos: Vec<Installed>,
+        /// The repo asking whether to remove it.
+        confirm: Option<String>,
     },
     /// The repo has no commits at all.
     Empty {
@@ -90,7 +98,7 @@ fn try_with<R>(f: impl FnOnce(&mut Screen) -> R) -> Option<R> {
     SCREEN.with(|s| s.try_borrow_mut().ok().map(|mut s| f(&mut s)))
 }
 
-fn with_notebook(f: impl FnOnce(&mut Notebook)) {
+pub fn with_notebook(f: impl FnOnce(&mut Notebook)) {
     try_with(|s| {
         if let Screen::Notebook(nb) = s {
             f(nb);
@@ -138,6 +146,19 @@ async fn start() {
             start_app(demo().await);
             return Ok(());
         }
+        // The repo list with made-up repos; refreshing it fails, as there's no real session.
+        #[cfg(debug_assertions)]
+        if hash == "demo-repos" {
+            let session = Session { token: String::new(), expires_at: None, app: None };
+            let repo = |name: &str, all| Installed {
+                full_name: name.into(),
+                all,
+                settings: "https://github.com/settings/installations".into(),
+            };
+            let repos = vec![repo("me/notes", false), repo("me/work", false), repo("team/wiki", true)];
+            set(Screen::Repos { session, repos, confirm: None });
+            return Ok(());
+        }
         let repo = if hash == "repos" {
             None
         } else if hash.contains('/') {
@@ -171,7 +192,7 @@ async fn start() {
 async fn show_repos(session: Session) -> Result<()> {
     set(Screen::Message("Loading your repositories…".into()));
     let repos = Api::new("", "", session.clone()).installed_repos().await?;
-    set(Screen::Repos { session, repos });
+    set(Screen::Repos { session, repos, confirm: None });
     Ok(())
 }
 
@@ -311,16 +332,14 @@ fn draw(screen: &Screen) {
         Screen::Login => card(
             r#"<p>A notebook stored as markdown in a GitHub repo.</p><button class="primary wide" data-act="login">Sign in with GitHub</button><p class="hint">Notes go straight from your browser to GitHub; this server stores nothing. gition only sees the repos you install the app on.</p>"#,
         ),
-        Screen::Repos { repos, .. } => {
-            let mut list: String = repos
-                .iter()
-                .map(|r| format!(r#"<button class="result" data-act="repo" data-name="{0}">{0}</button>"#, escape(r)))
-                .collect();
+        Screen::Repos { repos, confirm, .. } => {
+            let mut list: String =
+                repos.iter().map(|r| repo_row(r, confirm.as_deref() == Some(r.full_name.as_str()))).collect();
             if repos.is_empty() {
                 list = r#"<p class="muted">No repositories yet. Add the gition app to one.</p>"#.into();
             }
             card(&format!(
-                r#"<p>Open a repository</p><div class="list">{list}</div><div class="btns"><button data-act="refresh">Refresh</button><button data-act="install">Add repositories</button></div>"#
+                r#"<p>Open a repository</p><div class="list">{list}</div><div class="btns"><button class="push-left" data-act="logout">Sign out</button><button data-act="refresh">Refresh</button><button data-act="install">Add repositories</button></div>"#
             ))
         }
         Screen::Empty { full_name, .. } => card(&format!(
@@ -330,6 +349,31 @@ fn draw(screen: &Screen) {
         // The notebook draws itself.
         Screen::Notebook(_) => {}
     }
+}
+
+/// A row in the repo list, or how to remove it. Only GitHub can take a repo away from the app:
+/// its API refuses that to the app's own sign-in, so the row links to the installation's settings.
+fn repo_row(r: &Installed, confirm: bool) -> String {
+    let name = escape(&r.full_name);
+    if !confirm {
+        return format!(
+            r#"<div class="repo-row"><button class="result" data-act="repo" data-name="{name}">{name}</button><button class="ib" data-act="remove-ask" data-name="{name}" title="Remove from gition">{}</button></div>"#,
+            dom::icons::TRASH
+        );
+    }
+    let how = if r.all {
+        let owner = escape(r.full_name.split('/').next().unwrap_or_default());
+        format!(
+            "gition can see all of <b>{owner}</b>'s repositories. On GitHub, choose <b>Only select \
+             repositories</b> and leave <b>{name}</b> out."
+        )
+    } else {
+        format!("On GitHub, remove <b>{name}</b> under <b>Repository access</b> and save.")
+    };
+    format!(
+        r#"<div class="repo-row ask"><p>{how} The repository itself stays. This list refreshes when you come back.</p><div class="btns"><button data-act="remove-cancel">Cancel</button><button class="primary" data-act="settings" data-url="{}">Open GitHub settings</button></div></div>"#,
+        escape(&r.settings)
+    )
 }
 
 enum Then {
@@ -342,19 +386,34 @@ enum Then {
 }
 
 /// A click on a screen before the notebook.
-fn screen_click(screen: &Screen, act: &str, el: &web_sys::Element) -> Then {
-    match (screen, act) {
+fn screen_click(screen: &mut Screen, act: &str, el: &web_sys::Element) -> Then {
+    if let Screen::Repos { confirm, .. } = screen
+        && matches!(act, "remove-ask" | "remove-cancel")
+    {
+        *confirm = data(el, "name").filter(|_| act == "remove-ask");
+        draw(screen);
+        return Then::Nothing;
+    }
+    match (&*screen, act) {
         (_, "reload") => {
             let _ = window().location().reload();
             Then::Nothing
         }
         (_, "pick") => Then::Navigate("/#repos".into()),
+        (_, "logout") => {
+            sign_out();
+            Then::Nothing
+        }
         (Screen::Login, "login") => Then::Navigate("/auth/login".into()),
         (Screen::Repos { session, .. }, "repo") => match data(el, "name") {
             Some(name) => Then::Open(session.clone(), name),
             None => Then::Nothing,
         },
         (Screen::Repos { session, .. }, "refresh") => Then::Repos(session.clone()),
+        (_, "settings") => match data(el, "url") {
+            Some(url) => Then::OpenTab(url),
+            None => Then::Nothing,
+        },
         (Screen::Repos { session, .. }, "install") => {
             let app = session.app.clone().unwrap_or_default();
             Then::OpenTab(format!("https://github.com/apps/{app}/installations/new"))
@@ -499,20 +558,59 @@ fn listen() {
         });
     };
     dom::on(w.as_ref(), "beforeunload", move |_: Event| keep());
-    dom::on(target, "visibilitychange", move |_: Event| keep());
+    dom::on(target, "visibilitychange", move |_: Event| {
+        keep();
+        // Back from GitHub's settings after removing a repo there: show the list as it is now.
+        if !dom::document().hidden() {
+            let then = try_with(|s| match s {
+                Screen::Repos { session, confirm: Some(_), .. } => Then::Repos(session.clone()),
+                _ => Then::Nothing,
+            });
+            run(then.unwrap_or(Then::Nothing));
+        }
+    });
     dom::on(w.as_ref(), "hashchange", |_: Event| {
         let _ = window().location().reload();
     });
-    // The on-screen keyboard shrinks only the visual viewport: fit the page to it.
+    // The on-screen keyboard shrinks only the visual viewport, and iOS also pans it down the page to
+    // keep the focused field in sight. Keep the app on the part of the screen that's showing.
     if let Some(vv) = w.visual_viewport() {
-        dom::on(vv.as_ref(), "resize", |_: Event| {
-            let w = window();
-            let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else { return };
-            // While zoomed in, the visual viewport is the zoomed area, not the keyboard's room.
-            if (vv.scale() - 1.0).abs() > 0.01 {
-                return;
-            }
-            let _ = body.style().set_property("height", &format!("{}px", vv.height()));
-        });
+        dom::on(vv.as_ref(), "resize", |_: Event| fit_viewport(true));
+        dom::on(vv.as_ref(), "scroll", |_: Event| fit_viewport(false));
+    }
+}
+
+/// Sizes the (fixed) body to the visual viewport and moves it down by however far iOS panned that
+/// viewport, so the bar stays at the top and nothing is left under the keyboard. On a resize, also
+/// scrolls the page so the block being edited isn't behind the keyboard.
+fn fit_viewport(resized: bool) {
+    let w = window();
+    let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else { return };
+    // While zoomed in, the visual viewport is the zoomed area, not the keyboard's room.
+    if (vv.scale() - 1.0).abs() > 0.01 {
+        return;
+    }
+    let style = body.style();
+    let _ = style.set_property("height", &format!("{}px", vv.height()));
+    let _ = match vv.offset_top() {
+        top if top > 0.5 => style.set_property("transform", &format!("translateY({top}px)")),
+        _ => style.remove_property("transform").map(|_| ()),
+    };
+    if resized {
+        reveal_editing();
+    }
+}
+
+/// Scrolls the page so the textarea being edited starts in its upper part, if it's out of sight.
+fn reveal_editing() {
+    let (Some(scroll), Some(ta)) = (
+        dom::by_id::<web_sys::Element>("scroll"),
+        dom::document().active_element().filter(|e| e.tag_name() == "TEXTAREA"),
+    ) else {
+        return;
+    };
+    let (s, t) = (scroll.get_bounding_client_rect(), ta.get_bounding_client_rect());
+    if t.top() > s.bottom() - 48.0 || t.bottom() < s.top() {
+        scroll.set_scroll_top(scroll.scroll_top() + (t.top() - s.top() - s.height() / 3.0) as i32);
     }
 }

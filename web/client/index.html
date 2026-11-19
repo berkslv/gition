@@ -125,7 +125,12 @@
         -webkit-text-size-adjust: 100%;
       }
       body {
-        /* Updated from visualViewport so the on-screen keyboard doesn't cover the page. */
+        /* Fixed, and sized and moved with visualViewport (main.rs), so the on-screen keyboard neither
+           covers the page nor pans the bar off the top. */
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
         height: 100dvh;
         overflow: hidden;
       }
@@ -203,6 +208,47 @@
         overflow-y: auto;
         border: 1px solid var(--line);
         border-radius: 8px;
+      }
+
+      .btns .push-left {
+        margin-right: auto;
+      }
+      .repo-row {
+        display: flex;
+        align-items: center;
+        padding-right: 6px;
+      }
+      .repo-row .result {
+        flex: 1;
+        min-width: 0;
+      }
+      .repo-row .ib {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0.6;
+      }
+      .repo-row:hover .ib {
+        opacity: 1;
+      }
+      .repo-row .ib:hover {
+        color: var(--danger);
+      }
+      .repo-row .icon {
+        width: 16px;
+        height: 16px;
+      }
+      .repo-row.ask {
+        display: block;
+        padding: 10px 12px;
+        background: var(--hover);
+      }
+      .repo-row.ask p {
+        margin: 0;
+        font-size: 14px;
+      }
+      .repo-row.ask .btns {
+        margin-top: 10px;
       }
 
       /* ---- the notebook ---- */
@@ -645,6 +691,8 @@
         padding-top: 6px;
       }
       .result {
+        /* Rows keep their height; the list scrolls instead of squeezing them. */
+        flex: none;
         border: 0;
         border-radius: 5px;
         text-align: left;
@@ -652,6 +700,26 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+      #dlg-results .result {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+      #dlg-results .result > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .result .where,
+      .result .line {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .result mark {
+        background: var(--selection);
+        color: inherit;
+        border-radius: 2px;
       }
       .result.sel {
         background: var(--active);
@@ -687,6 +755,10 @@
         border-top: 1px solid var(--line);
         margin-top: 4px;
         padding-top: 8px;
+      }
+      .menu-sep {
+        border-top: 1px solid var(--line);
+        margin: 4px 0;
       }
       .menu-row > span:first-of-type {
         flex: 1;

@@ -77,7 +77,15 @@ pub struct Session {
 pub async fn session() -> Result<Option<Session>> {
     let (status, body) = http("GET", "/auth/token", &[], None).await?;
     match status {
-        200 => Ok(Some(serde_json::from_str(&body)?)),
+        // Anything but JSON is the page itself: nothing answers /auth/*, as under `trunk serve`.
+        200 => match serde_json::from_str(&body) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) if cfg!(debug_assertions) => bail!(
+                "The sign-in service isn't running here. Run `npx wrangler dev --port 8080 --local-upstream \
+                 localhost:8080` in web/, or open #demo."
+            ),
+            Err(_) => bail!("The sign-in service sent something unexpected. Try again in a moment."),
+        },
         401 => Ok(None),
         s => bail!("sign-in service error ({s}): {body}"),
     }
@@ -117,6 +125,17 @@ impl Head {
 
 /// The GraphQL fields [`Head::from_target`] reads.
 const TARGET: &str = "target { oid ... on Commit { tree { oid } } }";
+
+/// A repo the app is installed on.
+#[derive(Debug, Clone)]
+pub struct Installed {
+    /// `owner/name`.
+    pub full_name: String,
+    /// The installation covers every repo of its account, so one can't be taken out alone.
+    pub all: bool,
+    /// The installation's settings page on GitHub.
+    pub settings: String,
+}
 
 pub struct TreeEntry {
     pub path: String,
@@ -183,25 +202,30 @@ impl Api {
         Ok(value["data"].clone())
     }
 
-    /// Repos the signed-in user installed the app on, as `owner/name`.
-    pub async fn installed_repos(&self) -> Result<Vec<String>> {
+    /// Repos the signed-in user installed the app on.
+    pub async fn installed_repos(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
         let installs = self.call("GET", "/user/installations?per_page=100", None).await?;
         for inst in installs["installations"].as_array().into_iter().flatten() {
             let id = inst["id"].as_u64().unwrap_or_default();
+            let all = inst["repository_selection"].as_str() == Some("all");
+            let settings = inst["html_url"].as_str().unwrap_or("https://github.com/settings/installations").to_string();
             for page in 1..=10 {
                 let repos = self
                     .call("GET", &format!("/user/installations/{id}/repositories?per_page=100&page={page}"), None)
                     .await?;
                 let list = repos["repositories"].as_array().cloned().unwrap_or_default();
-                out.extend(list.iter().filter_map(|r| r["full_name"].as_str().map(str::to_string)));
+                out.extend(list.iter().filter_map(|r| {
+                    let full_name = r["full_name"].as_str()?.to_string();
+                    Some(Installed { full_name, all, settings: settings.clone() })
+                }));
                 if list.len() < 100 {
                     break;
                 }
             }
         }
-        out.sort_by_key(|s| s.to_lowercase());
-        out.dedup();
+        out.sort_by_key(|r| r.full_name.to_lowercase());
+        out.dedup_by(|a, b| a.full_name == b.full_name);
         Ok(out)
     }
 

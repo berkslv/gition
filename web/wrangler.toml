@@ -1,6 +1,7 @@
 # gition web: the static frontend (client/) and the sign-in worker (server/) in one Worker.
 # Build first (`trunk build --release` in client/, `worker-build --release` in server/),
-# then `npx wrangler dev` or `npx wrangler deploy` from this directory.
+# then `npx wrangler deploy` from this directory. Locally: `npx wrangler dev --port 8080 --local-upstream localhost:8080`,
+# so sign-in comes back to localhost instead of the route below.
 name = "gition"
 main = "server/build/index.js"
 compatibility_date = "2026-11-01"

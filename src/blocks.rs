@@ -1,12 +1,13 @@
 //! A markdown page as blocks, for the web editor. Each top-level element is a block, and so is
-//! each item of a top-level list. [`Doc`] keeps their exact source and the text between them,
+//! each item of a top-level list, nested ones too. [`Doc`] keeps their exact source and the text
+//! between them,
 //! so editing one block leaves the rest of the file as it was. [`render`] turns a block into
 //! HTML that is safe to put in the page: raw HTML shows as text, and only web links get an `href`.
 
 use std::ops::Range;
 use std::path::Path;
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CowStr, Event, HeadingLevel, Parser, Tag, TagEnd, TextMergeWithOffset, html};
 
 use crate::links::{self, md_options};
 use crate::paths;
@@ -26,11 +27,59 @@ pub enum Kind {
     Html,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Piece {
+    /// The block's markdown, without its indent.
     pub src: String,
     /// What follows the block up to the next one: line breaks, mostly.
     pub gap: String,
+    /// What starts each line of a nested list item, so its markdown reads as a list on its own.
+    pub indent: String,
+}
+
+impl Piece {
+    pub fn new(src: impl Into<String>, gap: impl Into<String>) -> Piece {
+        Piece { src: src.into(), gap: gap.into(), indent: String::new() }
+    }
+
+    /// The block's markdown as it is in the file.
+    fn text(&self) -> String {
+        if self.indent.is_empty() {
+            return self.src.clone();
+        }
+        let lines: Vec<String> = self
+            .src
+            .split('\n')
+            .map(|l| if l.is_empty() { String::new() } else { format!("{}{l}", self.indent) })
+            .collect();
+        lines.join("\n")
+    }
+
+    /// How deep the indent goes, with a tab as four spaces.
+    pub fn width(&self) -> usize {
+        self.indent.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
+    }
+
+    fn is_item(&self) -> bool {
+        kind(&self.src) == Some(Kind::Item)
+    }
+}
+
+/// `src` as a piece: a nested list item loses the indent its lines share.
+fn piece(src: &str, gap: &str) -> Piece {
+    let indent = &src[..src.len() - src.trim_start_matches([' ', '\t']).len()];
+    let lines = || src.split('\n').skip(1).filter(|l| !l.trim().is_empty());
+    if indent.is_empty() || marker(src.trim_start()).is_none() || !lines().all(|l| l.starts_with(indent)) {
+        return Piece::new(src, gap);
+    }
+    let dedented: Vec<&str> = src.split('\n').map(|l| l.strip_prefix(indent).unwrap_or(l.trim_start())).collect();
+    Piece { src: dedented.join("\n"), gap: gap.into(), indent: indent.into() }
+}
+
+/// Where the line holding byte `at` starts, if only indentation comes before `at` on it.
+fn line_start(src: &str, at: usize) -> usize {
+    let start = src[..at].rfind('\n').map_or(0, |n| n + 1);
+    if src[start..at].chars().all(|c| c == ' ' || c == '\t') { start } else { at }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,15 +104,21 @@ fn ranges(src: &str) -> Vec<Range<usize>> {
             Event::Start(tag) => {
                 if depth == 0 {
                     list = matches!(tag, Tag::List(_));
-                }
-                if depth == 0 || depth == 1 && list {
                     start = r.start;
+                }
+                // Each item of a list is a block, and a nested one ends the block before it.
+                if list && matches!(tag, Tag::Item) {
+                    let at = line_start(src, r.start);
+                    if depth > 1 {
+                        push(start..at);
+                    }
+                    start = at;
                 }
                 depth += 1;
             }
-            Event::End(_) => {
+            Event::End(tag) => {
                 depth -= 1;
-                if depth == 0 && !list || depth == 1 && list {
+                if depth == 0 && !list || depth == 1 && matches!(tag, TagEnd::Item) {
                     push(start..r.end);
                 }
             }
@@ -83,7 +138,7 @@ impl Doc {
             .enumerate()
             .map(|(i, r)| {
                 let next = rs.get(i + 1).map_or(src.len(), |n| n.start);
-                Piece { src: src[r.clone()].into(), gap: src[r.end..next].into() }
+                piece(&src[r.clone()], &src[r.end..next])
             })
             .collect();
         Doc { lead: src[..first.start].into(), pieces }
@@ -103,7 +158,7 @@ impl Doc {
                 continue;
             }
             out.push_str(gap.unwrap_or(""));
-            out.push_str(&p.src);
+            out.push_str(&p.text());
             gap = Some(&p.gap);
         }
         out.push_str(gap.unwrap_or(""));
@@ -121,6 +176,10 @@ impl Doc {
             return 0;
         }
         let mut sub = Doc::parse(&p.src);
+        // What it became keeps its indent, as long as it is still a list item.
+        for s in &mut sub.pieces {
+            s.indent = if s.is_item() { format!("{}{}", p.indent, s.indent) } else { String::new() };
+        }
         let Some(last) = sub.pieces.last_mut() else {
             self.pieces.insert(i, p);
             return 1;
@@ -157,12 +216,15 @@ impl Doc {
                     return None;
                 }
                 if line[len..].trim().is_empty() && last_line {
-                    // An empty item ends the list.
+                    // An empty nested item moves out a level; an empty one at the top ends the list.
+                    if line_start == 0 && self.indent(i, true) {
+                        return Some((i, at));
+                    }
                     if line_start > 0 {
                         let p = &mut self.pieces[i];
                         p.src.truncate(line_start - 1);
                         let gap = std::mem::replace(&mut p.gap, "\n\n".into());
-                        self.pieces.insert(i + 1, Piece { src: String::new(), gap: blank_line(gap) });
+                        self.pieces.insert(i + 1, Piece::new("", blank_line(gap)));
                         return Some((i + 1, 0));
                     }
                     self.pieces[i].src.clear();
@@ -176,7 +238,8 @@ impl Doc {
                 let p = &mut self.pieces[i];
                 let after = p.src.split_off(at);
                 let gap = std::mem::replace(&mut p.gap, "\n".into());
-                self.pieces.insert(i + 1, Piece { src: format!("{next}{after}"), gap });
+                let indent = p.indent.clone();
+                self.pieces.insert(i + 1, Piece { src: format!("{next}{after}"), gap, indent });
                 Some((i + 1, next.len()))
             }
             Some(Kind::Quote) => {
@@ -185,7 +248,7 @@ impl Doc {
                     let p = &mut self.pieces[i];
                     p.src.truncate(line_start - 1);
                     let gap = std::mem::replace(&mut p.gap, "\n\n".into());
-                    self.pieces.insert(i + 1, Piece { src: String::new(), gap });
+                    self.pieces.insert(i + 1, Piece::new("", gap));
                     return Some((i + 1, 0));
                 }
                 let next = format!("\n{} ", prefix.trim_end());
@@ -197,11 +260,64 @@ impl Doc {
                 let after = p.src.split_off(at).trim_start_matches('\n').to_string();
                 p.src.truncate(p.src.trim_end_matches('\n').len());
                 let gap = std::mem::replace(&mut p.gap, "\n\n".into());
-                self.pieces.insert(i + 1, Piece { src: after, gap });
+                self.pieces.insert(i + 1, Piece::new(after, gap));
                 Some((i + 1, 0))
             }
             _ => None,
         }
+    }
+
+    /// Tab on list item `i`: it goes into the item before it, or with `out`, out of the item it
+    /// is in. The items inside it move along. False when it can't.
+    pub fn indent(&mut self, i: usize, out: bool) -> bool {
+        let width = self.pieces[i].width();
+        if !self.pieces[i].is_item() {
+            return false;
+        }
+        // The nearest item before it that is less deep (with `out`), or as deep.
+        let Some(j) = (0..i)
+            .rev()
+            .take_while(|&j| self.pieces[j].is_item())
+            .find(|&j| if out { self.pieces[j].width() < width } else { self.pieces[j].width() <= width })
+        else {
+            return false;
+        };
+        let other = &self.pieces[j];
+        // Going in, it lines up with the items already inside the one before.
+        let child = self.pieces[j + 1..i].first().filter(|c| c.is_item() && c.width() > other.width());
+        let indent = if out {
+            other.indent.clone()
+        } else if let Some(c) = child.filter(|_| other.width() == width) {
+            c.indent.clone()
+        } else if other.width() == width {
+            let first = other.src.lines().next().unwrap_or("");
+            let bullet = first.find([' ', '\t']).unwrap_or(first.len());
+            format!("{}{}", other.indent, " ".repeat(bullet + 1))
+        } else {
+            return false;
+        };
+        let old = self.pieces[i].indent.clone();
+        let inside = self.pieces[i + 1..].iter().take_while(|p| p.is_item() && p.width() > width).count();
+        for p in &mut self.pieces[i..=i + inside] {
+            p.indent = format!("{indent}{}", p.indent.strip_prefix(old.as_str()).unwrap_or(""));
+        }
+        true
+    }
+
+    /// How many list items piece `i` is inside.
+    pub fn depth(&self, i: usize) -> usize {
+        let mut width = self.pieces[i].width();
+        let mut depth = 0;
+        for p in self.pieces[..i].iter().rev().take_while(|p| p.is_item()) {
+            if width == 0 {
+                break;
+            }
+            if p.width() < width {
+                width = p.width();
+                depth += 1;
+            }
+        }
+        depth
     }
 
     /// Makes sure piece `i` stands apart from its neighbours, as a paragraph between list items must.
@@ -333,7 +449,10 @@ pub fn source_offset(src: &str, rendered: &str) -> usize {
 pub fn render(src: &str, page: &Path) -> String {
     let mut events = Vec::new();
     let mut image: Option<(String, String)> = None;
-    for (ev, r) in Parser::new_ext(src, md_options()).into_offset_iter() {
+    // The open link: where its start tag is, its web address if it has one, and its text so far.
+    let mut open: Option<(usize, Option<String>, String)> = None;
+    let mut code = false;
+    for (ev, r) in TextMergeWithOffset::new(Parser::new_ext(src, md_options()).into_offset_iter()) {
         if let Some((attrs, alt)) = &mut image {
             match ev {
                 Event::End(TagEnd::Image) => {
@@ -351,8 +470,39 @@ pub fn render(src: &str, page: &Path) -> String {
             Event::End(TagEnd::HtmlBlock) => Event::Html("</pre>".into()),
             Event::Start(Tag::MetadataBlock(_)) => Event::Html("<pre class=\"meta\">".into()),
             Event::End(TagEnd::MetadataBlock(_)) => Event::Html("</pre>".into()),
-            Event::Start(Tag::Link { dest_url, .. }) => Event::Html(link(&dest_url, page).into()),
-            Event::End(TagEnd::Link) => Event::Html("</a>".into()),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                open = Some((events.len(), web_host(&dest_url).map(|_| dest_url.to_string()), String::new()));
+                Event::Html(link(&dest_url, page).into())
+            }
+            Event::End(TagEnd::Link) => {
+                // A link whose text is its address shows as a bare one.
+                if let Some((at, Some(url), text)) = open.take()
+                    && text.trim() == url
+                {
+                    events.truncate(at);
+                    events.extend(web_link(&url));
+                    continue;
+                }
+                Event::Html("</a>".into())
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                code = true;
+                ev
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                code = false;
+                ev
+            }
+            Event::Text(t) if open.is_some() => {
+                if let Some((_, _, text)) = &mut open {
+                    text.push_str(&t);
+                }
+                Event::Text(t)
+            }
+            Event::Text(t) if !code => {
+                linkify(&t, &mut events);
+                continue;
+            }
             Event::Start(Tag::Image { dest_url, .. }) => {
                 image = Some((image_source(&dest_url, page), String::new()));
                 continue;
@@ -377,6 +527,73 @@ fn link(dest: &str, page: &Path) -> String {
         format!("<a data-page=\"{}\">", escape(&paths::to_slash(&target)))
     } else {
         "<a>".into()
+    }
+}
+
+/// A bare web address, as a link.
+fn web_link(url: &str) -> [Event<'static>; 3] {
+    [
+        Event::Html(format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">", escape(url)).into()),
+        Event::Text(CowStr::from(url.to_string())),
+        Event::Html("</a>".into()),
+    ]
+}
+
+/// The host of an http(s) address, without `www.`.
+fn web_host(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Pushes `text` as text, with each http(s) address in it as a link.
+fn linkify<'a>(text: &CowStr<'a>, out: &mut Vec<Event<'a>>) {
+    let mut rest: &str = text;
+    let mut found = false;
+    while let Some((start, end)) = next_url(rest) {
+        found = true;
+        if start > 0 {
+            out.push(Event::Text(CowStr::from(rest[..start].to_string())));
+        }
+        out.extend(web_link(&rest[start..end]));
+        rest = &rest[end..];
+    }
+    if !found {
+        out.push(Event::Text(text.clone()));
+    } else if !rest.is_empty() {
+        out.push(Event::Text(CowStr::from(rest.to_string())));
+    }
+}
+
+/// Where the first http(s) address in `s` starts and ends, leaving out punctuation that ends a
+/// sentence and a `)` that closes text around it.
+fn next_url(s: &str) -> Option<(usize, usize)> {
+    let lower = s.to_ascii_lowercase();
+    let mut from = 0;
+    loop {
+        let start = from + ["http://", "https://"].iter().filter_map(|p| lower[from..].find(p)).min()?;
+        from = start + 4;
+        if s[..start].chars().next_back().is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let len =
+            s[start..].find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"')).unwrap_or(s.len() - start);
+        let mut url = &s[start..start + len];
+        loop {
+            let unbalanced = url.ends_with(')') && url.matches('(').count() < url.matches(')').count();
+            match url.chars().next_back() {
+                Some('.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_' | '~') => url = &url[..url.len() - 1],
+                Some(')') if unbalanced => url = &url[..url.len() - 1],
+                _ => break,
+            }
+        }
+        if web_host(url).is_some() {
+            return Some((start, start + url.len()));
+        }
     }
 }
 
@@ -427,7 +644,8 @@ mod tests {
                 "# Title",
                 "Some *text*\nmore",
                 "- a",
-                "- b\n  - nested",
+                "- b",
+                "- nested",
                 "1. one",
                 "2. two",
                 "```\ncode\n\n```",
@@ -440,6 +658,47 @@ mod tests {
         for s in ["", "\n\n", "text", "  # indented\n\n\n", "[x]: http://a\n\npara\n", "a\r\nb\r\n\r\nc"] {
             assert_eq!(Doc::parse(s).text(), s);
         }
+    }
+
+    #[test]
+    fn nested_items_are_blocks_that_tab_moves() {
+        let src = "- **Alternative titles:**\n    - MCP Explained\n    - \"MCP Is Dead\"?\n    - I Cut My MCP Context\n\nAfter\n";
+        let mut d = Doc::parse(src);
+        assert_eq!(
+            srcs(&d),
+            ["- **Alternative titles:**", "- MCP Explained", "- \"MCP Is Dead\"?", "- I Cut My MCP Context", "After"]
+        );
+        assert_eq!((0..5).map(|i| d.depth(i)).collect::<Vec<_>>(), [0, 1, 1, 1, 0]);
+        assert_eq!(d.text(), src);
+        assert!(!render(&d.pieces[1].src, Path::new("a.md")).contains("<code>"));
+
+        // Shift+Tab takes an item out, and its siblings after it go inside it.
+        assert!(d.indent(2, true));
+        assert_eq!(
+            d.text(),
+            "- **Alternative titles:**\n    - MCP Explained\n- \"MCP Is Dead\"?\n    - I Cut My MCP Context\n\nAfter\n"
+        );
+        assert!(!d.indent(2, true));
+        // Tab puts it back, with what's inside it.
+        assert!(d.indent(2, false));
+        assert_eq!(
+            d.text(),
+            "- **Alternative titles:**\n    - MCP Explained\n    - \"MCP Is Dead\"?\n        - I Cut My MCP Context\n\nAfter\n"
+        );
+        assert_eq!((0..5).map(|i| d.depth(i)).collect::<Vec<_>>(), [0, 1, 1, 2, 0]);
+        // The first item, and one already a level deeper than the one before, can't go in.
+        assert!(!d.indent(0, false));
+        assert!(!d.indent(3, false));
+
+        // Enter on an empty nested item takes it out a level.
+        let mut d = Doc::parse("- a\n  - b\n");
+        assert_eq!(d.enter(1, 3), Some((2, 2)));
+        assert_eq!(d.pieces[2].indent, "  ");
+        assert_eq!(d.enter(2, 2), Some((2, 2)));
+        assert_eq!(d.text(), "- a\n  - b\n- \n");
+        d.pieces[1].src = "- b\n- c".into();
+        d.settle(1);
+        assert_eq!(d.text(), "- a\n  - b\n  - c\n- \n");
     }
 
     #[test]
@@ -531,6 +790,25 @@ mod tests {
         assert!(html.contains("data-at=\"2\""), "{html}");
         assert!(toggle_task(&mut src, 2));
         assert_eq!(src, "- [x] task");
+    }
+
+    #[test]
+    fn links_bare_web_addresses() {
+        let page = Path::new("a.md");
+        let link = |url: &str| format!("<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">{url}</a>");
+        let html = render("see https://www.imdb.com/title/tt5537002/.", page);
+        assert!(html.contains(&format!("see {}.", link("https://www.imdb.com/title/tt5537002/"))), "{html}");
+        let html = render("(https://a.org/x_(y)) and http://b.org?q=1&r=2", page);
+        assert!(html.contains(&link("https://a.org/x_(y)")), "{html}");
+        assert!(html.contains(&link("http://b.org?q=1&amp;r=2")), "{html}");
+        let html = render("<https://a.org> [https://a.org](https://a.org)", page);
+        assert_eq!(html.matches("<a href=\"https://a.org\"").count(), 2, "{html}");
+        for plain in
+            ["`https://a.org`", "```\nhttps://a.org\n```", "xhttps://a.org", "https://", "[t](x.md) mailto:a@b.c"]
+        {
+            assert!(!render(plain, page).contains("href"), "{plain}");
+        }
+        assert_eq!(web_host("HTTPS://user@www.a.org:8080/x"), Some("a.org:8080"));
     }
 
     #[test]

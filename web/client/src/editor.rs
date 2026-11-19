@@ -27,8 +27,8 @@ pub struct Editor {
     /// The block being edited, and its textarea.
     pub editing: Option<usize>,
     ta: Option<HtmlTextAreaElement>,
-    /// What each block's element shows, to redraw only the ones that changed.
-    shown: Vec<String>,
+    /// What each block's element shows and how deep it is, to redraw only the ones that changed.
+    shown: Vec<(String, usize)>,
 }
 
 impl Editor {
@@ -36,7 +36,7 @@ impl Editor {
         let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let text = text.replace("\r\n", "\n");
         let doc = if plain {
-            Doc { lead: String::new(), pieces: vec![Piece { src: text.clone(), gap: String::new() }] }
+            Doc { lead: String::new(), pieces: vec![Piece::new(text.clone(), "")] }
         } else {
             Doc::parse(&text)
         };
@@ -82,13 +82,15 @@ impl Editor {
 
     /// Brings `root`'s elements in line with the blocks, redrawing only those that changed.
     pub fn sync(&mut self, root: &Element) {
-        let new: Vec<String> = (0..self.doc.pieces.len()).map(|i| self.html(i)).collect();
+        let new: Vec<(String, usize)> = (0..self.doc.pieces.len())
+            .map(|i| (self.html(i), if self.plain { 0 } else { self.doc.depth(i) }))
+            .collect();
         let old = std::mem::take(&mut self.shown);
         let pre = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
         let room = old.len().min(new.len()) - pre;
         let suf = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
         let children = root.children();
-        for gone in &old[pre..old.len() - suf] {
+        for (gone, _) in &old[pre..old.len() - suf] {
             if gone == EDITING {
                 self.ta = None;
             }
@@ -98,9 +100,12 @@ impl Editor {
         }
         let before = children.item(pre as u32);
         let document = dom::document();
-        for (i, html) in new.iter().enumerate().take(new.len() - suf).skip(pre) {
+        for (i, (html, depth)) in new.iter().enumerate().take(new.len() - suf).skip(pre) {
             let Ok(div) = document.create_element("div") else { continue };
             let _ = div.set_attribute("data-i", &i.to_string());
+            if *depth > 0 {
+                let _ = div.set_attribute("style", &format!("margin-left: {}em", *depth as f64 * 1.5));
+            }
             if html == EDITING {
                 div.set_class_name("blk editing");
                 if let Ok(ta) = document.create_element("textarea") {
@@ -186,9 +191,9 @@ impl Editor {
             Some(last) if last.src.trim().is_empty() => last.src = src,
             Some(last) => {
                 let gap = std::mem::replace(&mut last.gap, "\n\n".into());
-                pieces.push(Piece { src, gap });
+                pieces.push(Piece::new(src, gap));
             }
-            None => pieces.push(Piece { src, gap: "\n".into() }),
+            None => pieces.push(Piece::new(src, "\n")),
         }
         pieces.len() - 1
     }
@@ -235,7 +240,8 @@ impl Editor {
                 return true;
             }
             "Tab" if !self.plain && blocks::kind(&self.doc.pieces[i].src) == Some(Kind::Item) => {
-                Some((i, indent(&mut self.doc.pieces[i].src, start, e.shift_key())))
+                self.doc.indent(i, e.shift_key());
+                Some((i, start))
             }
             _ => None,
         };
@@ -301,19 +307,6 @@ impl Editor {
         };
         self.goto(root, j, at);
     }
-}
-
-/// Indents the line holding byte `at` by two spaces, or takes up to two away. Returns where
-/// the caret goes.
-fn indent(src: &mut String, at: usize, out: bool) -> usize {
-    let start = src[..at].rfind('\n').map_or(0, |n| n + 1);
-    if !out {
-        src.insert_str(start, "  ");
-        return at + 2;
-    }
-    let n = src[start..].bytes().take(2).take_while(|b| *b == b' ').count();
-    src.replace_range(start..start + n, "");
-    at.saturating_sub(n).max(start)
 }
 
 /// Sizes the textarea's font for the kind of block it holds.

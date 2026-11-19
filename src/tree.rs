@@ -138,12 +138,39 @@ pub fn search_items(fs: &dyn Storage) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// A match must score this much per typed character. Letters in a row score about 26 each;
+/// letters scattered over a long path, which only look like a match, score about 15.
+const MIN_SCORE_PER_CHAR: u32 = 20;
+
 /// The indices of `items` whose labels fuzzy-match `query`, best first.
 pub fn search(items: &[(String, PathBuf)], query: &str) -> Vec<usize> {
     let mut matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let min = MIN_SCORE_PER_CHAR * query.chars().filter(|c| !c.is_whitespace()).count() as u32;
     let labels = items.iter().enumerate().map(|(i, (l, _))| Labeled(i, l.as_str()));
-    pattern.match_list(labels, &mut matcher).into_iter().map(|(l, _)| l.0).collect()
+    pattern.match_list(labels, &mut matcher).into_iter().filter(|(_, s)| *s >= min).map(|(l, _)| l.0).collect()
+}
+
+/// The first line of `text` holding `query`, ignoring case, and where in that line it is (bytes).
+pub fn find_text<'a>(text: &'a str, query: &str) -> Option<(&'a str, usize, usize)> {
+    let query: Vec<char> = query.trim().chars().collect();
+    if query.is_empty() {
+        return None;
+    }
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    text.lines().find_map(|line| {
+        line.char_indices().find_map(|(start, _)| {
+            let mut rest = line[start..].char_indices();
+            for &q in &query {
+                match rest.next() {
+                    Some((_, c)) if same(c, q) => {}
+                    _ => return None,
+                }
+            }
+            let end = rest.next().map_or(line.len(), |(i, _)| start + i);
+            Some((line, start, end))
+        })
+    })
 }
 
 /// A search label that remembers its index.
@@ -203,5 +230,35 @@ mod tests {
         assert_eq!(names, [".hidden", "assets", "Projects", "A.md", "AGENTS.md", "b.md", "INDEX.md", "notes.txt"]);
 
         assert_eq!(markdown_files(&store).len(), 7);
+    }
+
+    #[test]
+    fn search_drops_scattered_matches() {
+        let items: Vec<(String, PathBuf)> = [
+            "Blog/Feature Flagging in .NET with OpenFeature and flagd/Feature Flagging",
+            "Archive/Technologies/Frontend/React/11 Lifecycle & components",
+            "Work/Fleet/Plan",
+            "Blog/Clean and Reusable Logic with EF Core",
+        ]
+        .iter()
+        .map(|l| (l.to_string(), PathBuf::from(format!("{l}.md"))))
+        .collect();
+        assert_eq!(search(&items, "fleet"), [2]);
+        assert_eq!(search(&items, "ef core"), [3]);
+        assert_eq!(search(&items, "log"), [3]);
+    }
+
+    #[test]
+    fn finds_text_ignoring_case() {
+        let text = "# Log
+
+- FleetVision dönüşümü tarafında
+";
+        let (line, start, end) = find_text(text, "fleet").unwrap();
+        assert_eq!((&line[start..end], line), ("Fleet", "- FleetVision dönüşümü tarafında"));
+        let (line, start, end) = find_text(text, "DÖNÜŞ").unwrap();
+        assert_eq!(&line[start..end], "dönüş");
+        assert_eq!(find_text(text, "missing"), None);
+        assert_eq!(find_text(text, "  "), None);
     }
 }

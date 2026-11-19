@@ -18,7 +18,7 @@ use gition::{links, pages, paste, paths};
 use wasm_bindgen::JsCast;
 use web_sys::{ClipboardEvent, Element, Event, HtmlElement, HtmlInputElement, KeyboardEvent, MouseEvent};
 
-use crate::dom::{self, by_id, closest, data, set_html};
+use crate::dom::{self, by_id, closest, data, icons, set_html};
 use crate::editor::Editor;
 use crate::pictures::Pictures;
 use crate::workspace::{Ctx, WebHost};
@@ -51,13 +51,36 @@ enum Dialog {
     },
     Rename(PathBuf),
     Delete(PathBuf),
-    Search {
-        items: Vec<(String, PathBuf)>,
-        results: Vec<usize>,
-        sel: usize,
-    },
+    Search(Box<Search>),
     Menu,
 }
+
+/// A search result: a page from the dialog's items, and for a match in its text, that line as HTML.
+struct Hit {
+    item: usize,
+    line: Option<String>,
+}
+
+/// The search dialog. Titles are matched as you type; page text is searched in the background,
+/// a few milliseconds at a time (see [`Notebook::search_text`]), so typing never waits for it.
+struct Search {
+    items: Vec<(String, PathBuf)>,
+    results: Vec<Hit>,
+    sel: usize,
+    /// The query, lowercased, for the text search under way; empty when there's none.
+    query: String,
+    /// Bumped on every keystroke, so a text search for an older query stops.
+    run: u64,
+    /// The next item the text search looks at.
+    next: usize,
+    /// Each page's text, lowercased, once read. `Some(None)`: it couldn't be read (still downloading).
+    texts: Vec<Option<Option<String>>>,
+}
+
+/// Wait this long after the last keystroke before searching page text.
+const TEXT_SEARCH_DELAY_MS: i32 = 150;
+/// How long one step of the text search may run before the browser gets a turn.
+const TEXT_SEARCH_SLICE_MS: f64 = 8.0;
 
 pub struct Notebook {
     ctx: Rc<Ctx>,
@@ -469,6 +492,11 @@ impl Notebook {
                     Some("rename") => self.ask_rename(path),
                     Some("delete") => self.ask_delete(path),
                     Some("github") => self.open_external(&path),
+                    Some("logout") => {
+                        self.flush();
+                        self.ctx.persist();
+                        crate::sign_out();
+                    }
                     _ => {}
                 }
             }
@@ -518,10 +546,13 @@ impl Notebook {
                     true
                 }
                 "ArrowDown" | "ArrowUp" => {
-                    if let Some(Dialog::Search { results, sel, .. }) = &mut self.dialog {
+                    if let Some(Dialog::Search(s)) = &mut self.dialog {
                         let down = e.key() == "ArrowDown";
-                        *sel =
-                            if down { (*sel + 1).min(results.len().saturating_sub(1)) } else { sel.saturating_sub(1) };
+                        s.sel = if down {
+                            (s.sel + 1).min(s.results.len().saturating_sub(1))
+                        } else {
+                            s.sel.saturating_sub(1)
+                        };
                         self.draw_results();
                     }
                     true
@@ -553,12 +584,14 @@ impl Notebook {
                 return true;
             }
         }
+        // Tab moves list items, so it never moves the focus to the next link instead.
+        let tab = e.key() == "Tab";
         if !in_editor {
-            return false;
+            return tab;
         }
         let mut used = false;
         self.with_editor(|ed, root| used = ed.key(root, e));
-        used
+        used || tab
     }
 
     pub fn input(&mut self, e: &Event) {
@@ -566,11 +599,7 @@ impl Notebook {
             self.with_editor(|ed, _| ed.input());
         } else if closest(e.target(), "#dlg-input").is_some() && matches!(self.dialog, Some(Dialog::Search { .. })) {
             let query = by_id::<HtmlInputElement>("dlg-input").map(|i| i.value()).unwrap_or_default();
-            if let Some(Dialog::Search { items, results, sel }) = &mut self.dialog {
-                *results = tree::search(items, &query);
-                *sel = 0;
-            }
-            self.draw_results();
+            self.search(&query);
         }
     }
 
@@ -639,8 +668,9 @@ impl Notebook {
                         Err(m) => toast(&m, true),
                     }
                 }
-                Msg::Title(url, Some(title)) => self.with_editor(|ed, root| {
-                    ed.link_title(root, &url, &title);
+                // A page that won't give its title still becomes a link, named after its address.
+                Msg::Title(url, title) => self.with_editor(|ed, root| {
+                    ed.link_title(root, &url, &title.unwrap_or_else(|| paste::address_title(&url)));
                 }),
                 Msg::Images(page, images) => self.place_images(&page, images),
                 Msg::Downloaded(Some(e)) => toast(&format!("Download failed: {e}"), true),
@@ -650,7 +680,7 @@ impl Notebook {
                         self.load(path);
                     }
                 }
-                Msg::Title(_, None) | Msg::Ran(..) => {}
+                Msg::Ran(..) => {}
             }
         }
         self.ctx.persist();
@@ -812,6 +842,8 @@ impl Notebook {
                 choice("dark", icons::MOON, "Dark"),
                 choice("", icons::MONITOR, "System"),
             ));
+            items.push(r#"<div class="menu-sep"></div>"#.into());
+            items.push(item("logout", icons::LOGOUT, "Sign out"));
         }
         let r = anchor.get_bounding_client_rect();
         let width = dom::window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(1000.0);
@@ -879,26 +911,102 @@ impl Notebook {
 
     fn open_search(&mut self) {
         let items = tree::search_items(self.fs());
-        let results = (0..items.len()).collect();
+        let results = (0..items.len()).map(|item| Hit { item, line: None }).collect();
+        let texts = vec![None; items.len()];
+        let search = Search { items, results, sel: 0, query: String::new(), run: 0, next: 0, texts };
         let html = r#"<div class="backdrop" data-act="dlg-cancel"></div><div class="dlg search" role="dialog"><input id="dlg-input" placeholder="Search pages" autocomplete="off" autocapitalize="off" spellcheck="false"><div id="dlg-results"></div></div>"#;
-        self.show_dialog(Dialog::Search { items, results, sel: 0 }, html);
+        self.show_dialog(Dialog::Search(Box::new(search)), html);
         self.draw_results();
     }
 
+    /// Shows the pages whose title matches `query` now, and starts looking for it in page text
+    /// once typing pauses.
+    fn search(&mut self, query: &str) {
+        let Some(Dialog::Search(s)) = &mut self.dialog else { return };
+        s.run += 1;
+        s.sel = 0;
+        s.next = 0;
+        s.results = if query.trim().is_empty() {
+            (0..s.items.len()).map(|item| Hit { item, line: None }).collect()
+        } else {
+            tree::search(&s.items, query).into_iter().map(|item| Hit { item, line: None }).collect()
+        };
+        s.query = if query.trim().chars().count() >= 2 { query.trim().to_lowercase() } else { String::new() };
+        let (run, text) = (s.run, !s.query.is_empty());
+        self.draw_results();
+        if text {
+            dom::timeout(TEXT_SEARCH_DELAY_MS, move || crate::with_notebook(|nb| nb.search_text(run)));
+        }
+    }
+
+    /// One step of the text search for run `run`: looks through pages until its time slice is up,
+    /// shows what it found, and schedules the next step.
+    fn search_text(&mut self, run: u64) {
+        let fs = &*self.ctx.work;
+        let Some(Dialog::Search(s)) = &mut self.dialog else { return };
+        if s.run != run || s.query.is_empty() {
+            return;
+        }
+        let began = js_sys::Date::now();
+        let found = s.results.len();
+        while s.next < s.items.len() && s.results.len() < RESULTS && js_sys::Date::now() - began < TEXT_SEARCH_SLICE_MS
+        {
+            let item = s.next;
+            s.next += 1;
+            if s.results.iter().any(|h| h.item == item) {
+                continue;
+            }
+            let path = &s.items[item].1;
+            let text = s.texts[item].get_or_insert_with(|| fs.read_to_string(path).ok().map(|t| t.to_lowercase()));
+            let Some(at) = text.as_deref().and_then(|t| t.find(&s.query)) else { continue };
+            // Lowercasing keeps line breaks, so the match is on the same line of the original.
+            let n = text.as_deref().map_or(0, |t| t[..at].matches('\n').count());
+            let Ok(original) = fs.read_to_string(path) else { continue };
+            let line = original.lines().nth(n).unwrap_or_default();
+            let html = match tree::find_text(line, &s.query) {
+                Some((line, start, end)) => snippet(line, start, end),
+                None => snippet(line, 0, 0),
+            };
+            s.results.push(Hit { item, line: Some(html) });
+        }
+        let more = s.next < s.items.len() && s.results.len() < RESULTS;
+        if s.results.len() > found {
+            self.draw_results();
+        }
+        if more {
+            dom::timeout(0, move || crate::with_notebook(|nb| nb.search_text(run)));
+        }
+    }
+
     fn draw_results(&self) {
-        let Some(Dialog::Search { items, results, sel }) = &self.dialog else { return };
+        let Some(Dialog::Search(s)) = &self.dialog else { return };
+        let (items, results, sel) = (&s.items, &s.results, &s.sel);
         let mut html = String::new();
-        for (n, &i) in results.iter().take(RESULTS).enumerate() {
-            let (label, path) = &items[i];
+        for (n, hit) in results.iter().take(RESULTS).enumerate() {
+            let (label, path) = &items[hit.item];
             let cur = if n == *sel { " sel" } else { "" };
+            let title = pages::title(path);
+            let place = label.trim_end_matches('/').strip_suffix(title.as_str()).unwrap_or_default();
+            let place = place.trim_end_matches('/');
+            let place = if place.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<span class="where">{}</span>"#, escape(place))
+            };
+            let line = hit.line.as_deref().map(|l| format!(r#"<span class="line">{l}</span>"#)).unwrap_or_default();
             html.push_str(&format!(
-                r#"<button class="result{cur}" data-act="search-open" data-path="{}">{}</button>"#,
+                r#"<button class="result{cur}" data-act="search-open" data-path="{}"><span class="what">{}</span>{place}{line}</button>"#,
                 escape(&paths::to_slash(path)),
-                escape(label)
+                escape(&title)
             ));
         }
         if html.is_empty() {
             html.push_str(r#"<p class="muted pad">No pages match.</p>"#);
+        }
+        if self.host.downloading().is_some() {
+            html.push_str(
+                r#"<p class="hint pad">Some pages are still downloading, so their text isn't searched yet.</p>"#,
+            );
         }
         set_html("dlg-results", &html);
     }
@@ -911,9 +1019,9 @@ impl Notebook {
             Dialog::NewPage { dir, page } if !input.trim().is_empty() => self.new_page(dir, page, input.trim()),
             Dialog::Rename(old) if !input.trim().is_empty() => self.rename(&old, input.trim()),
             Dialog::Delete(path) => self.delete(&path),
-            Dialog::Search { items, results, sel } => {
-                if let Some(&i) = results.get(sel) {
-                    let path = items[i].1.clone();
+            Dialog::Search(s) => {
+                if let Some(hit) = s.results.get(s.sel) {
+                    let path = s.items[hit.item].1.clone();
                     self.open(path);
                 }
                 Ok(())
@@ -1002,25 +1110,17 @@ fn find<'a>(node: &'a Node, path: &Path) -> Option<&'a Node> {
     node.children.iter().filter(|c| path.starts_with(&c.path)).find_map(|c| find(c, path))
 }
 
-/// Menu icons, drawn in the text color.
-mod icons {
-    macro_rules! icon {
-        ($($name:ident = $paths:literal;)*) => {$(
-            pub const $name: &str = concat!(
-                r#"<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">"#,
-                $paths,
-                "</svg>"
-            );
-        )*};
-    }
-    icon! {
-        PLUS = r#"<path d="M12 5v14M5 12h14"/>"#;
-        PENCIL = r#"<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>"#;
-        TRASH = r#"<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/>"#;
-        EXTERNAL = r#"<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#;
-        PALETTE = r#"<circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/><path d="M12 2a10 10 0 0 0 0 20 2 2 0 0 0 2-2 2 2 0 0 1 2-2h2a4 4 0 0 0 4-4c0-5.5-4.5-10-10-10Z"/>"#;
-        SUN = r#"<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>"#;
-        MOON = r#"<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>"#;
-        MONITOR = r#"<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>"#;
-    }
+/// The part of `line` around bytes `start..end`, as HTML with that part marked.
+fn snippet(line: &str, start: usize, end: usize) -> String {
+    const AROUND: usize = 40;
+    let from = line[..start].char_indices().rev().nth(AROUND).map_or(0, |(i, _)| i);
+    let to = line[end..].char_indices().nth(AROUND).map_or(line.len(), |(i, _)| end + i);
+    format!(
+        "{}{}<mark>{}</mark>{}{}",
+        if from > 0 { "…" } else { "" },
+        escape(line[from..start].trim_start()),
+        escape(&line[start..end]),
+        escape(&line[end..to]),
+        if to < line.len() { "…" } else { "" }
+    )
 }

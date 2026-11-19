@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2
+
+### Added
+- Web: nested list items are blocks of their own. Tab moves a list item into the item before it, Shift+Tab moves it out, and what's inside it moves along. Enter on an empty nested item moves it out a level. Tab never jumps to the next link on the page.
+- Web: web addresses in text show as links. A pasted address always becomes a `[title](url)` link; when the site won't give its title, the link is named after the address.
+- Web: search also finds text inside pages, with the matching line shown. It runs in the background, so typing stays smooth.
+- Web: Sign out, in the ⋯ menu and on the repository list.
+- Web: a remove button next to each repository, which explains how to remove it from gition on GitHub and opens the settings there.
+
+### Fixed
+- Web: on iPhones, opening the keyboard no longer leaves a black area at the top of the screen.
+- Web: search no longer lists pages that only scatter the typed letters over a long path, and its results no longer squash together.
+
 ## 0.4.1
 
 ### Fixed

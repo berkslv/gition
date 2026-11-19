@@ -21,6 +21,15 @@ pub fn in_link(before: &str) -> bool {
     before.ends_with("](") || before.rfind('<').is_some_and(|i| !before[i..].contains('>'))
 }
 
+/// A link title for a page whose own title can't be read: its address without the scheme,
+/// `www.` and a trailing `/`.
+pub fn address_title(url: &str) -> String {
+    let s = url.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    s.trim_end_matches('/').to_string()
+}
+
 /// `[title](url)`, with the brackets and backslashes in the title escaped.
 pub fn link(title: &str, url: &str) -> String {
     let mut text = String::with_capacity(title.len());
@@ -236,6 +245,12 @@ pub fn image_ext(mime: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_titles() {
+        assert_eq!(address_title("https://www.imdb.com/title/tt5537002/"), "imdb.com/title/tt5537002");
+        assert_eq!(address_title("http://a.org"), "a.org");
+    }
 
     #[test]
     fn bare_urls() {
