@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+- Web: the 0.4.0 web app didn't deploy, because CI installed a newer `worker-build` that doesn't build the sign-in worker. CI now pins the version that matches.
+
 ## 0.4.0
 
 ### Added
