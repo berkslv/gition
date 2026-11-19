@@ -6,8 +6,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Style;
@@ -22,6 +20,7 @@ use crate::images::Images;
 use crate::keymap::{Action, Keymap};
 use crate::links;
 use crate::markdown::{self, Block};
+use crate::pages;
 use crate::paste;
 use crate::paths;
 use crate::pointer::{Selection, Target};
@@ -1304,28 +1303,13 @@ impl App {
     // ---- search --------------------------------------------------------
 
     fn open_search(&mut self) {
-        let items: Vec<(String, PathBuf)> = tree::markdown_files(&*self.fs)
-            .into_iter()
-            .map(|p| {
-                let label = if paths::is_index(&p) {
-                    format!("{}/", paths::to_slash(&paths::parent(&p)))
-                } else {
-                    let s = paths::to_slash(&p);
-                    s[..s.len() - 3].to_string()
-                };
-                (label, p)
-            })
-            .collect();
+        let items = tree::search_items(&*self.fs);
         self.modal = Modal::Search { query: String::new(), results: (0..items.len()).collect(), items, sel: 0 };
     }
 
     fn search_update(&mut self) {
         let Modal::Search { query, items, results, sel } = &mut self.modal else { return };
-        let mut matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
-        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-        let labels: Vec<(usize, &str)> = items.iter().enumerate().map(|(i, (l, _))| (i, l.as_str())).collect();
-        let matched = pattern.match_list(labels.iter().map(|(i, l)| Labeled(*i, l)), &mut matcher);
-        *results = matched.into_iter().map(|(l, _)| l.0).collect();
+        *results = tree::search(items, query);
         *sel = 0;
     }
 
@@ -1337,31 +1321,18 @@ impl App {
         }
         match kind {
             PromptKind::NewPage(dir) => {
-                let mut rel = dir.join(clean_rel(input)?);
-                if !paths::is_markdown(&rel) {
-                    rel = PathBuf::from(format!("{}.md", rel.to_string_lossy()));
-                }
-                let title = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let rel = pages::new_page_path(&dir, input)?;
+                let title = pages::title(&rel);
                 self.create_and_edit(rel, &title)
             }
             PromptKind::NewFolder(dir) => {
-                let folder = dir.join(clean_rel(input)?);
-                if self.fs.exists(&folder) {
-                    bail!("'{}' already exists", paths::to_slash(&folder));
-                }
-                let title = folder.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let folder = pages::new_folder_path(&*self.fs, &dir, input)?;
+                let title = pages::title(&folder);
                 self.expanded.insert(folder.clone());
                 self.create_and_edit(folder.join(INDEX), &title)
             }
             PromptKind::Rename(old) => {
-                let mut new = clean_rel(input)?;
-                // Like `mv`: naming an existing folder moves into it.
-                let same = paths::to_slash(&new).to_lowercase() == paths::to_slash(&old).to_lowercase();
-                if self.fs.is_dir(&new) && !same {
-                    new = new.join(old.file_name().unwrap_or_default());
-                } else if !self.fs.is_dir(&old) && paths::is_markdown(&old) && !paths::is_markdown(&new) {
-                    new = PathBuf::from(format!("{}.md", new.to_string_lossy()));
-                }
+                let new = pages::rename_target(&*self.fs, &old, input)?;
                 self.move_path(&old, &new)
             }
             PromptKind::InsertImage(page) => self.insert_image(&page, input),
@@ -1392,28 +1363,10 @@ impl App {
         if new == old {
             return Ok(());
         }
-        if new.starts_with(old) {
-            bail!("Can't move a folder into itself");
-        }
-        let case_only = paths::to_slash(new).to_lowercase() == paths::to_slash(old).to_lowercase();
-        if self.fs.exists(new) && !case_only {
-            bail!("'{}' already exists", paths::to_slash(new));
-        }
         if self.host.downloading().is_some() {
             bail!(STILL_DOWNLOADING);
         }
-        let mut edits = Vec::new();
-        for f in tree::markdown_files(&*self.fs) {
-            let Ok(src) = self.fs.read_to_string(&f) else { continue };
-            let f_new = links::map_moved(&f, old, new);
-            if let Some(out) = links::rewrite(&src, &f, &f_new, old, new) {
-                edits.push((f_new, out));
-            }
-        }
-        self.fs.rename(old, new)?;
-        for (f, content) in &edits {
-            self.fs.write(f, content.as_bytes())?;
-        }
+        let edited = pages::move_path(&*self.fs, old, new)?;
         self.expanded = self.expanded.iter().map(|p| links::map_moved(p, old, new)).collect();
         if let Some(p) = &mut self.page {
             p.path = links::map_moved(&p.path, old, new);
@@ -1425,7 +1378,7 @@ impl App {
         self.reveal(new);
         self.reload_page();
         self.refresh_changes();
-        match edits.len() {
+        match edited {
             0 => self.info(format!("Moved to {}", paths::to_slash(new))),
             n => self.info(format!("Moved to {}, updated links in {n} page(s)", paths::to_slash(new))),
         }
@@ -1489,15 +1442,7 @@ impl App {
 
     /// Copies an image into the assets dir and links it from `page`.
     fn insert_image_bytes(&mut self, page: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-        let name = Path::new(name).file_name().ok_or_else(|| anyhow!("Invalid file name: {name}"))?;
-        let assets = PathBuf::from(&self.cfg.assets_dir);
-        self.fs.create_dir_all(&assets)?;
-        let rel = unique_asset(&*self.fs, &assets, Path::new(name), bytes);
-        if !self.fs.exists(&rel) {
-            self.fs.write(&rel, bytes)?;
-        }
-        let alt = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let md = format!("![{alt}]({})", paths::encode_link(&paths::relative(&paths::parent(page), &rel)));
+        let md = pages::save_image(&*self.fs, &self.cfg.assets_dir, page, name, bytes)?;
         match &mut self.editor {
             Some(e) if e.path == page => {
                 e.ta.insert_str(&md);
@@ -1518,15 +1463,6 @@ impl App {
         self.reload_tree();
         self.refresh_changes();
         Ok(())
-    }
-}
-
-/// A search item that remembers its index.
-struct Labeled<'a>(usize, &'a str);
-
-impl AsRef<str> for Labeled<'_> {
-    fn as_ref(&self) -> &str {
-        self.1
     }
 }
 
@@ -1588,14 +1524,6 @@ fn edit_line(input: &mut String, cursor: &mut usize, k: &Input) {
     }
 }
 
-/// Validates user input as a path relative to some dir in the repo.
-fn clean_rel(input: &str) -> Result<PathBuf> {
-    let trimmed = input.trim().trim_matches('/').trim_matches('\\');
-    paths::normalize(Path::new(trimmed))
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow!("Invalid path: {input}"))
-}
-
 fn expand_user_path(input: &str) -> PathBuf {
     let s = input.trim().trim_matches(|c| c == '"' || c == '\'');
     let s = s.strip_prefix("file://").unwrap_or(s);
@@ -1605,22 +1533,4 @@ fn expand_user_path(input: &str) -> PathBuf {
         return PathBuf::from(home).join(rest.trim_start_matches(['/', '\\']));
     }
     PathBuf::from(s)
-}
-
-/// Picks `assets/<name>`, reusing an identical existing file or adding `-1`, `-2`, … .
-fn unique_asset(fs: &dyn Storage, assets: &Path, name: &Path, bytes: &[u8]) -> PathBuf {
-    let stem = name.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = name.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    for n in 0.. {
-        let candidate = if n == 0 { assets.join(name) } else { assets.join(format!("{stem}-{n}{ext}")) };
-        if !fs.exists(&candidate) {
-            return candidate;
-        }
-        match fs.read(&candidate) {
-            Err(_) => continue,
-            Ok(existing) if existing == bytes => return candidate,
-            Ok(_) => continue,
-        }
-    }
-    unreachable!()
 }

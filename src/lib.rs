@@ -1,4 +1,5 @@
 pub mod app;
+pub mod blocks;
 pub mod config;
 #[cfg(feature = "native")]
 pub mod git;
@@ -8,6 +9,7 @@ pub mod import;
 pub mod keymap;
 pub mod links;
 pub mod markdown;
+pub mod pages;
 pub mod paste;
 pub mod paths;
 pub mod pointer;

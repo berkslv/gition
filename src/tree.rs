@@ -3,6 +3,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as MatcherConfig, Matcher};
+
 use crate::paths;
 use crate::repo::{AGENTS, INDEX};
 use crate::storage::Storage;
@@ -117,6 +120,39 @@ pub fn markdown_files(fs: &dyn Storage) -> Vec<PathBuf> {
     walk(fs, Path::new(""), &mut out);
     out.sort();
     out
+}
+
+/// Every page, labeled as search shows it: its path without `.md`, or `folder/` for a folder page.
+pub fn search_items(fs: &dyn Storage) -> Vec<(String, PathBuf)> {
+    markdown_files(fs)
+        .into_iter()
+        .map(|p| {
+            let label = if paths::is_index(&p) {
+                format!("{}/", paths::to_slash(&paths::parent(&p)))
+            } else {
+                let s = paths::to_slash(&p);
+                s[..s.len() - 3].to_string()
+            };
+            (label, p)
+        })
+        .collect()
+}
+
+/// The indices of `items` whose labels fuzzy-match `query`, best first.
+pub fn search(items: &[(String, PathBuf)], query: &str) -> Vec<usize> {
+    let mut matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let labels = items.iter().enumerate().map(|(i, (l, _))| Labeled(i, l.as_str()));
+    pattern.match_list(labels, &mut matcher).into_iter().map(|(l, _)| l.0).collect()
+}
+
+/// A search label that remembers its index.
+struct Labeled<'a>(usize, &'a str);
+
+impl AsRef<str> for Labeled<'_> {
+    fn as_ref(&self) -> &str {
+        self.1
+    }
 }
 
 #[cfg(test)]

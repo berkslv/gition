@@ -1,8 +1,8 @@
 //! The browser's working copy of a repo and the GitHub-backed [`Host`].
 //!
-//! `base` is the last commit we know of; `work` is the editable copy. Ctrl+S
-//! writes to `work` (persisted in localStorage), Ctrl+G commits the difference
-//! with the Git Data API and fast-forwards the branch.
+//! `base` is the last commit we know of; `work` is the editable copy. Edits are
+//! written to `work` as they're typed (persisted in localStorage), and sync commits
+//! the difference with the Git Data API and fast-forwards the branch.
 //!
 //! File contents and trees are kept in the [`Cache`]. When it has the base commit's
 //! tree, a repo opens without waiting for GitHub, and the first fetch catches up.

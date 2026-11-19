@@ -1,173 +1,143 @@
-//! gition in the browser: the same app and UI as the terminal build, drawn with
-//! Ratzilla, with a GitHub repo as storage.
+//! gition in the browser: a notebook of pages you edit in place, with a GitHub repo as storage.
+//! The pages, sync and file operations are the terminal app's; the interface is the web's own.
 
 mod cache;
+mod dom;
+mod editor;
 mod github;
+mod notebook;
 mod pictures;
 mod workspace;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
-use gition::app::App;
+use gition::blocks::escape;
 use gition::config::{Config, FILE_NAME};
-use gition::images::{self, Images};
-use gition::keymap::Action;
 use gition::repo;
 use gition::storage::Storage;
 use ratatui_textarea::{Input, Key};
-use ratzilla::ratatui::Frame;
-use ratzilla::ratatui::Terminal;
-use ratzilla::ratatui::backend::{Backend, ClearType, WindowSize};
-use ratzilla::ratatui::buffer::Cell;
-use ratzilla::ratatui::layout::Rect;
-use ratzilla::ratatui::layout::{Position, Size};
-use ratzilla::ratatui::style::{Color, Modifier, Style};
-use ratzilla::ratatui::text::Line;
-use ratzilla::ratatui::widgets::{Block, Clear, Paragraph, Wrap};
-use ratzilla::{CellSized, DomBackend};
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{
-    BeforeUnloadEvent, ClipboardEvent, Event, HtmlElement, HtmlTextAreaElement, InputEvent, KeyboardEvent, MouseEvent,
-    PointerEvent, WheelEvent,
-};
+use web_sys::{ClipboardEvent, Event, KeyboardEvent, MouseEvent};
 
+use crate::dom::{closest, data, set_html, window};
 use crate::github::{Api, Session, status};
-use crate::pictures::Pictures;
-use crate::workspace::{Ctx, Local, WebHost, get_item, set_item};
+use crate::notebook::Notebook;
+use crate::workspace::{Ctx, Local, get_item, set_item};
 
 const LAST_REPO: &str = "gition:last";
+const THEME: &str = "gition:theme";
+
+/// The chosen theme: `light`, `dark`, or empty to follow the system.
+pub fn theme() -> String {
+    get_item(THEME).filter(|t| t == "light" || t == "dark").unwrap_or_default()
+}
+
+/// Shows and remembers `theme`.
+pub fn set_theme(theme: &str) {
+    set_item(THEME, theme);
+    apply_theme();
+}
+
+fn apply_theme() {
+    let doc = dom::document();
+    let Some(root) = doc.document_element() else { return };
+    let theme = theme();
+    let _ = match theme.as_str() {
+        "" => root.remove_attribute("data-theme"),
+        t => root.set_attribute("data-theme", t),
+    };
+    // The browser's bar follows the page, not the system, once a theme is picked.
+    let Ok(metas) = doc.query_selector_all("meta[name=theme-color]") else { return };
+    for i in 0..metas.length() {
+        let Some(meta) = metas.item(i).and_then(|m| m.dyn_into::<web_sys::Element>().ok()) else { continue };
+        let own = if meta.get_attribute("media").is_some_and(|m| m.contains("dark")) { "dark" } else { "light" };
+        let shown = if theme.is_empty() { own } else { &theme };
+        let _ = meta.set_attribute("content", if shown == "dark" { "#0f1115" } else { "#ffffff" });
+    }
+}
 
 enum Screen {
     Message(String),
-    /// An error; Enter reloads.
+    /// An error; it offers to reload.
     Error(String),
     Login,
     Repos {
         session: Session,
         repos: Vec<String>,
-        sel: usize,
     },
     /// The repo has no commits at all.
     Empty {
         session: Session,
         full_name: String,
     },
-    App(Box<App>, Rc<Ctx>),
-}
-
-type Shared = Rc<RefCell<Screen>>;
-
-fn set(screen: &Shared, s: Screen) {
-    *screen.borrow_mut() = s;
-    redraw();
+    Notebook(Box<Notebook>),
 }
 
 thread_local! {
-    /// Whether the screen may have changed since the last frame was drawn.
-    static DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static SCREEN: RefCell<Screen> = RefCell::new(Screen::Message("Loading…".into()));
+    /// A pointer is down: a focus change now is the start of a click, not the end of editing.
+    static PRESSING: Cell<bool> = const { Cell::new(false) };
+    static TOAST: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Asks for the next animation frame to draw. Drawing only then keeps an idle tab from
-/// re-laying out and re-theming every cell 60 times a second, which drains phone batteries.
-fn redraw() {
-    DIRTY.with(|d| d.set(true));
+/// Runs `f` on the screen. `None` if it's busy, which only happens to events a DOM change
+/// fires while the screen is being updated.
+fn try_with<R>(f: impl FnOnce(&mut Screen) -> R) -> Option<R> {
+    SCREEN.with(|s| s.try_borrow_mut().ok().map(|mut s| f(&mut s)))
 }
 
-/// Any input may change what's on screen. Listening in the capture phase marks the frame
-/// dirty before the handlers below run, whichever of them takes the event.
-fn redraw_on_input() {
-    let w = window();
-    let mark = Closure::<dyn FnMut()>::new(redraw);
-    let options = web_sys::AddEventListenerOptions::new();
-    options.set_capture(true);
-    options.set_passive(true);
-    for name in [
-        "keydown",
-        "paste",
-        "beforeinput",
-        "pointerdown",
-        "pointermove",
-        "pointerup",
-        "pointercancel",
-        "wheel",
-        "contextmenu",
-        "hashchange",
-        "resize",
-        "focus",
-    ] {
-        let _ = w.add_event_listener_with_callback_and_add_event_listener_options(
-            name,
-            mark.as_ref().unchecked_ref(),
-            &options,
-        );
-    }
-    mark.forget();
+fn with_notebook(f: impl FnOnce(&mut Notebook)) {
+    try_with(|s| {
+        if let Screen::Notebook(nb) = s {
+            f(nb);
+        }
+    });
 }
 
-fn window() -> web_sys::Window {
-    web_sys::window().expect("no window")
+fn set(screen: Screen) {
+    try_with(|s| {
+        draw(&screen);
+        *s = screen;
+    });
+}
+
+/// Shows a message at the bottom for a few seconds.
+pub fn toast(text: &str, error: bool) {
+    let Some(el) = dom::by_id::<web_sys::Element>("toast") else { return };
+    el.set_text_content(Some(text));
+    el.set_class_name(if error { "show err" } else { "show" });
+    let id = TOAST.with(|t| t.get().wrapping_add(1));
+    TOAST.with(|t| t.set(id));
+    dom::timeout(if error { 6000 } else { 3000 }, move || {
+        if TOAST.with(Cell::get) == id {
+            el.set_class_name("");
+        }
+    });
 }
 
 fn main() {
     console_error_panic_hook::set_once();
-    let screen: Shared = Rc::new(RefCell::new(Screen::Message("Loading…".into())));
-    redraw_on_input();
-    listen(&screen);
-    spawn_local(start(screen.clone()));
-    spawn_local(async move {
-        // The grid is sized from a measured cell, so measure with the final font.
-        if let Some(fonts) = window().document().map(|d| d.fonts())
-            && let Ok(ready) = fonts.ready()
-        {
-            let _ = wasm_bindgen_futures::JsFuture::from(ready).await;
-        }
-        let grid = Grid { dom: DomBackend::new_by_id("term").expect("DOM backend"), grid: None, forced: None };
-        run(Terminal::new(grid).expect("terminal"), screen);
-    });
-}
-
-/// Checks for changes on every animation frame, like Ratzilla's `draw_web`, but draws only
-/// when something changed. Lets the DOM backend rebuild its grid first, and then redraws
-/// everything when it did.
-fn run(mut terminal: Terminal<Grid>, screen: Shared) {
-    let frame: FrameCallback = Rc::default();
-    let next = frame.clone();
-    *frame.borrow_mut() = Some(Closure::new(move || {
-        let rebuilt = terminal.backend_mut().sync();
-        if rebuilt {
-            let _ = terminal.clear();
-        }
-        let changed = prepare(&screen, terminal.backend().dom.cell_size_px());
-        if DIRTY.with(|d| d.replace(false)) || changed || rebuilt {
-            if let Err(e) = terminal.draw(|f| draw(f, &screen)) {
-                web_sys::console::error_1(&e.to_string().into());
-            }
-            show_pictures(&screen, terminal.backend().dom.cell_size_css_px());
-        }
-        request_frame(&next);
-    }));
-    request_frame(&frame);
-}
-
-type FrameCallback = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
-
-fn request_frame(f: &FrameCallback) {
-    if let Some(cb) = &*f.borrow() {
-        let _ = window().request_animation_frame(cb.as_ref().unchecked_ref());
-    }
+    apply_theme();
+    listen();
+    dom::every(300, || with_notebook(|nb| nb.tick()));
+    spawn_local(start());
 }
 
 // ---- startup ----------------------------------------------------------------
 
-async fn start(screen: Shared) {
+async fn start() {
     let result: Result<()> = async {
         let hash = window().location().hash().unwrap_or_default();
         let hash = hash.trim_start_matches('#');
+        #[cfg(debug_assertions)]
+        if hash == "demo" {
+            start_app(demo().await);
+            return Ok(());
+        }
         let repo = if hash == "repos" {
             None
         } else if hash.contains('/') {
@@ -184,24 +154,24 @@ async fn start(screen: Shared) {
         };
         let (session, local) = futures_util::future::join(github::session(), local).await;
         let Some(session) = session? else {
-            set(&screen, Screen::Login);
+            set(Screen::Login);
             return Ok(());
         };
         match repo {
-            Some(r) => open_repo(&screen, session, &r, local).await,
-            None => show_repos(&screen, session).await,
+            Some(r) => open_repo(session, &r, local).await,
+            None => show_repos(session).await,
         }
     }
     .await;
     if let Err(e) = result {
-        set(&screen, Screen::Error(format!("{e:#}")));
+        set(Screen::Error(format!("{e:#}")));
     }
 }
 
-async fn show_repos(screen: &Shared, session: Session) -> Result<()> {
-    set(screen, Screen::Message("Loading your repositories…".into()));
+async fn show_repos(session: Session) -> Result<()> {
+    set(Screen::Message("Loading your repositories…".into()));
     let repos = Api::new("", "", session.clone()).installed_repos().await?;
-    set(screen, Screen::Repos { session, repos, sel: 0 });
+    set(Screen::Repos { session, repos });
     Ok(())
 }
 
@@ -221,48 +191,99 @@ fn valid_name(s: &str) -> bool {
 }
 
 /// Opens a repo. `local` is what [`Local::load`] gave for it, if it's been read already.
-async fn open_repo(screen: &Shared, session: Session, full_name: &str, local: Option<Local>) -> Result<()> {
+async fn open_repo(session: Session, full_name: &str, local: Option<Local>) -> Result<()> {
     // The name comes from the URL, and goes into API paths: no `..` or other path tricks.
     let (owner, name) = full_name
         .split_once('/')
         .filter(|(o, n)| valid_name(o) && valid_name(n))
         .ok_or_else(|| anyhow!("not a repository: {full_name}"))?;
-    set(screen, Screen::Message(format!("Opening {full_name}…")));
+    set(Screen::Message(format!("Opening {full_name}…")));
     let mut local = match local {
         Some(l) => l,
         None => Local::load(full_name).await,
     };
     let api = Api::new(owner, name, session.clone());
-    // Show what we had last time right away; the app's first fetch catches up with GitHub,
-    // and reports errors like lost access there. Only the first screen's files that the
-    // cache lacks are downloaded first; if that fails, those pages say so when opened.
+    // Show what we had last time right away; the first fetch catches up with GitHub, and
+    // reports errors like lost access. Only the first screen's files that the cache lacks are
+    // downloaded first; if that fails, those pages say so when opened.
     if let Some((branch, base)) = local.cached.take() {
         set_hash(full_name);
         set_item(LAST_REPO, full_name);
         let ctx = Ctx::new(api, branch, base, local);
         let _ = ctx.load_first().await;
-        start_app(screen, ctx);
+        start_app(ctx);
         return Ok(());
     }
     let (branch, head) = match api.default_branch().await {
         Err(e) if status(&e) == Some(404) => {
             set_item(LAST_REPO, "");
-            return show_repos(screen, session).await;
+            return show_repos(session).await;
         }
         other => other?,
     };
     set_hash(full_name);
     set_item(LAST_REPO, full_name);
     let Some(head) = head else {
-        set(screen, Screen::Empty { session, full_name: full_name.into() });
+        set(Screen::Empty { session, full_name: full_name.into() });
         return Ok(());
     };
     let ctx = Ctx::open(api, branch, head, local).await?;
-    start_app(screen, ctx);
+    start_app(ctx);
     Ok(())
 }
 
-fn start_app(screen: &Shared, ctx: Rc<Ctx>) {
+/// Debug builds: a notebook held in memory, to try the interface without signing in.
+#[cfg(debug_assertions)]
+async fn demo() -> Rc<Ctx> {
+    use gition::storage::Blob;
+    const FILES: &[(&str, &str)] = &[
+        (
+            "INDEX.md",
+            "# Demo
+
+Welcome to **gition**. Click any block to edit it.
+
+- [ ] a task
+- [x] a done task
+- see [Plan](Projects/plan.md)
+
+> A quote
+
+```
+code block
+```
+",
+        ),
+        (
+            "Projects/INDEX.md",
+            "# Projects
+",
+        ),
+        (
+            "Projects/plan.md",
+            "# Plan
+
+1. one
+2. two
+
+Back [home](../INDEX.md).
+",
+        ),
+        (
+            "Ideas.md",
+            "# Ideas
+
+A <b>raw</b> tag stays text.
+",
+        ),
+    ];
+    let files = FILES.iter().map(|(p, c)| (p.into(), Blob::Data(c.as_bytes().to_vec()))).collect();
+    let base = workspace::Snapshot { commit: "demo".into(), tree: "demo".into(), files, modes: Default::default() };
+    let session = Session { token: String::new(), expires_at: None, app: None };
+    Ctx::new(Api::new("demo", "notebook", session), "main".into(), base, Local::load("demo/notebook").await)
+}
+
+fn start_app(ctx: Rc<Ctx>) {
     let (cfg, warning) = match ctx.work.read_to_string(Path::new(FILE_NAME)) {
         Ok(text) => match Config::parse(&text) {
             Ok(c) => (c, None),
@@ -270,20 +291,114 @@ fn start_app(screen: &Shared, ctx: Rc<Ctx>) {
         },
         Err(_) => (Config::default(), None),
     };
-    let mut app = App::new(Box::new(ctx.work.clone()), Box::new(WebHost(ctx.clone())), cfg, Images::default());
-    if let Some(w) = warning {
-        app.error(w);
+    let nb = Notebook::new(ctx, cfg, warning);
+    set(Screen::Notebook(Box::new(nb)));
+}
+
+// ---- screens before the notebook ----------------------------------------------------
+
+fn card(body: &str) {
+    set_html("app", &format!(r#"<div class="center"><div class="card"><h1>gition</h1>{body}</div></div>"#));
+}
+
+fn draw(screen: &Screen) {
+    match screen {
+        Screen::Message(m) => card(&format!(r#"<p class="muted">{}</p>"#, escape(m))),
+        Screen::Error(m) => card(&format!(
+            r#"<p class="error">{}</p><div class="btns"><button data-act="pick">Pick another repository</button><button class="primary" data-act="reload">Reload</button></div>"#,
+            escape(m)
+        )),
+        Screen::Login => card(
+            r#"<p>A notebook stored as markdown in a GitHub repo.</p><button class="primary wide" data-act="login">Sign in with GitHub</button><p class="hint">Notes go straight from your browser to GitHub; this server stores nothing. gition only sees the repos you install the app on.</p>"#,
+        ),
+        Screen::Repos { repos, .. } => {
+            let mut list: String = repos
+                .iter()
+                .map(|r| format!(r#"<button class="result" data-act="repo" data-name="{0}">{0}</button>"#, escape(r)))
+                .collect();
+            if repos.is_empty() {
+                list = r#"<p class="muted">No repositories yet. Add the gition app to one.</p>"#.into();
+            }
+            card(&format!(
+                r#"<p>Open a repository</p><div class="list">{list}</div><div class="btns"><button data-act="refresh">Refresh</button><button data-act="install">Add repositories</button></div>"#
+            ))
+        }
+        Screen::Empty { full_name, .. } => card(&format!(
+            r#"<p><b>{}</b> is empty. Commit a first page to start a notebook?</p><div class="btns"><button data-act="pick">Pick another repository</button><button class="primary" data-act="init">Create</button></div>"#,
+            escape(full_name)
+        )),
+        // The notebook draws itself.
+        Screen::Notebook(_) => {}
     }
-    app.touch = touch();
-    app.start_fetch();
-    ctx.fill_in_background();
-    set(screen, Screen::App(Box::new(app), ctx));
+}
+
+enum Then {
+    Nothing,
+    Navigate(String),
+    OpenTab(String),
+    Open(Session, String),
+    Repos(Session),
+    InitEmpty(Session, String),
+}
+
+/// A click on a screen before the notebook.
+fn screen_click(screen: &Screen, act: &str, el: &web_sys::Element) -> Then {
+    match (screen, act) {
+        (_, "reload") => {
+            let _ = window().location().reload();
+            Then::Nothing
+        }
+        (_, "pick") => Then::Navigate("/#repos".into()),
+        (Screen::Login, "login") => Then::Navigate("/auth/login".into()),
+        (Screen::Repos { session, .. }, "repo") => match data(el, "name") {
+            Some(name) => Then::Open(session.clone(), name),
+            None => Then::Nothing,
+        },
+        (Screen::Repos { session, .. }, "refresh") => Then::Repos(session.clone()),
+        (Screen::Repos { session, .. }, "install") => {
+            let app = session.app.clone().unwrap_or_default();
+            Then::OpenTab(format!("https://github.com/apps/{app}/installations/new"))
+        }
+        (Screen::Empty { session, full_name }, "init") => Then::InitEmpty(session.clone(), full_name.clone()),
+        _ => Then::Nothing,
+    }
+}
+
+fn run(then: Then) {
+    let fail = |e: anyhow::Error| set(Screen::Error(format!("{e:#}")));
+    match then {
+        Then::Nothing => {}
+        Then::Navigate(url) => {
+            let _ = window().location().assign(&url);
+            if url.starts_with("/#") {
+                let _ = window().location().reload();
+            }
+        }
+        Then::OpenTab(url) => {
+            let _ = window().open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer");
+        }
+        Then::Open(session, name) => {
+            spawn_local(async move { open_repo(session, &name, None).await.unwrap_or_else(fail) })
+        }
+        Then::Repos(session) => spawn_local(async move { show_repos(session).await.unwrap_or_else(fail) }),
+        Then::InitEmpty(session, name) => spawn_local(async move {
+            let res = async {
+                let (owner, repo_name) = name.split_once('/').unwrap_or_default();
+                let api = Api::new(owner, repo_name, session.clone());
+                let (path, content) = repo::starter_files(repo_name, &Config::default().assets_dir).remove(0);
+                api.create_file(&path, &content, "gition: init").await?;
+                open_repo(session, &name, None).await
+            }
+            .await;
+            res.unwrap_or_else(fail)
+        }),
+    }
 }
 
 // ---- input --------------------------------------------------------------------
 
-/// Converts a browser key event; `None` for lone modifiers and unknown keys.
-fn to_input(e: &KeyboardEvent) -> Option<Input> {
+/// Converts a browser key event for the keymap; `None` for lone modifiers and unknown keys.
+pub fn to_input(e: &KeyboardEvent) -> Option<Input> {
     let key = match e.key().as_str() {
         "Enter" => Key::Enter,
         "Escape" => Key::Esc,
@@ -319,817 +434,85 @@ fn to_input(e: &KeyboardEvent) -> Option<Input> {
     Some(Input { key, ctrl, alt, shift: e.shift_key() })
 }
 
-enum Then {
-    Nothing,
-    Reload,
-    Navigate(String),
-    OpenTab(String),
-    Open(Session, String),
-    Repos(Session),
-    InitEmpty(Session, String),
-}
+fn listen() {
+    let doc = dom::document();
+    let target: &web_sys::EventTarget = doc.as_ref();
 
-fn on_key(screen: &Shared, e: &KeyboardEvent) {
-    if e.is_composing() {
-        return;
-    }
-    if let Some(input) = to_input(e)
-        && handle(screen, input)
-    {
-        e.prevent_default();
-        fit_keyboard(screen);
-    }
-}
-
-/// Runs one key through the current screen; true when gition used it.
-fn handle(screen: &Shared, input: Input) -> bool {
-    let plain = !input.ctrl && !input.alt && !matches!(input.key, Key::F(_));
-    let mut then = Then::Nothing;
-    let handled = {
-        let mut s = screen.borrow_mut();
-        match &mut *s {
-            Screen::App(app, _) => {
-                // Leave browser shortcuts (paste, reload, …) alone unless gition binds them. Ctrl+C goes
-                // to gition: it copies a selection, and goes back to the repo list without one.
-                let bound = Action::ALL.iter().any(|&a| app.keys.is(a, &input));
-                let paste = input.ctrl && input.key == Key::Char('v');
-                let take = !paste && (plain || bound || app.editor.is_some() && (input.ctrl || input.alt));
-                if take {
-                    app.on_key(input.clone());
-                }
-                take
-            }
-            Screen::Login if input.key == Key::Enter => {
-                then = Then::Navigate("/auth/login".into());
-                true
-            }
-            Screen::Error(_) if input.key == Key::Enter => {
-                then = Then::Reload;
-                true
-            }
-            Screen::Error(_) if input.key == Key::Char('p') => {
-                then = Then::Navigate("/#repos".into());
-                true
-            }
-            Screen::Repos { session, repos, sel } if plain => {
-                match input.key {
-                    Key::Up | Key::Char('k') => *sel = sel.saturating_sub(1),
-                    Key::Down | Key::Char('j') => *sel = (*sel + 1).min(repos.len().saturating_sub(1)),
-                    Key::Enter => {
-                        if let Some(r) = repos.get(*sel) {
-                            then = Then::Open(session.clone(), r.clone());
-                        }
-                    }
-                    Key::Char('i') => {
-                        let app = session.app.clone().unwrap_or_default();
-                        then = Then::OpenTab(format!("https://github.com/apps/{app}/installations/new"));
-                    }
-                    Key::Char('r') => then = Then::Repos(session.clone()),
-                    _ => {}
-                }
-                true
-            }
-            Screen::Empty { session, full_name } if plain => {
-                match input.key {
-                    Key::Char('y') => then = Then::InitEmpty(session.clone(), full_name.clone()),
-                    Key::Char('n') | Key::Esc => then = Then::Navigate("/#repos".into()),
-                    _ => {}
-                }
-                true
-            }
-            _ => false,
-        }
-    };
-    let screen = screen.clone();
-    match then {
-        Then::Nothing => {}
-        Then::Reload => {
-            let _ = window().location().reload();
-        }
-        Then::Navigate(url) => {
-            let _ = window().location().assign(&url);
-            if url.starts_with("/#") {
-                let _ = window().location().reload();
-            }
-        }
-        Then::OpenTab(url) => {
-            let _ = window().open_with_url_and_target(&url, "_blank");
-        }
-        Then::Open(session, name) => spawn_local(async move {
-            if let Err(e) = open_repo(&screen, session, &name, None).await {
-                set(&screen, Screen::Error(format!("{e:#}")));
-            }
-        }),
-        Then::Repos(session) => spawn_local(async move {
-            if let Err(e) = show_repos(&screen, session).await {
-                set(&screen, Screen::Error(format!("{e:#}")));
-            }
-        }),
-        Then::InitEmpty(session, name) => spawn_local(async move {
-            let res = async {
-                let (owner, repo_name) = name.split_once('/').unwrap_or_default();
-                let api = Api::new(owner, repo_name, session.clone());
-                let (path, content) = repo::starter_files(repo_name, &Config::default().assets_dir).remove(0);
-                api.create_file(&path, &content, "gition: init").await?;
-                open_repo(&screen, session, &name, None).await
-            }
-            .await;
-            if let Err(e) = res {
-                set(&screen, Screen::Error(format!("{e:#}")));
-            }
-        }),
-    }
-    handled
-}
-
-fn listen(screen: &Shared) {
-    let w = window();
-    let s = screen.clone();
-    let keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| on_key(&s, &e));
-    let s = screen.clone();
-    let paste = Closure::<dyn FnMut(ClipboardEvent)>::new(move |e: ClipboardEvent| {
-        let Screen::App(app, ctx) = &mut *s.borrow_mut() else { return };
-        let Some(data) = e.clipboard_data() else { return };
-        // Images win over the text that often comes with them.
-        let files = data.files();
-        let images: Vec<_> = (0..files.as_ref().map_or(0, |f| f.length()))
-            .filter_map(|i| files.as_ref()?.get(i))
-            .filter_map(|f| Some((gition::paste::image_ext(&f.type_())?, f)))
-            .collect();
-        if !images.is_empty() {
-            e.prevent_default();
-            let ctx = ctx.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut batch = Vec::new();
-                for (ext, file) in images {
-                    if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-                        batch.push((ext, js_sys::Uint8Array::new(&buf).to_vec()));
-                    }
-                }
-                ctx.pasted.borrow_mut().push(batch);
-            });
-        } else if let Ok(text) = data.get_data("text") {
-            app.on_paste(text);
-            e.prevent_default();
-        }
-    });
-    let s = screen.clone();
-    let unload = Closure::<dyn FnMut(BeforeUnloadEvent)>::new(move |e: BeforeUnloadEvent| {
-        // Saved edits survive a reload; an open editor with unsaved text doesn't.
-        if let Ok(screen) = s.try_borrow()
-            && let Screen::App(app, _) = &*screen
-            && app.editor.as_ref().is_some_and(|ed| ed.dirty())
-        {
-            e.prevent_default();
-            e.set_return_value("");
-        }
-    });
-    let hashchange = Closure::<dyn FnMut()>::new(|| {
-        let _ = window().location().reload();
-    });
-    let _ = w.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref());
-    let _ = w.add_event_listener_with_callback("paste", paste.as_ref().unchecked_ref());
-    let _ = w.add_event_listener_with_callback("beforeunload", unload.as_ref().unchecked_ref());
-    let _ = w.add_event_listener_with_callback("hashchange", hashchange.as_ref().unchecked_ref());
-    keydown.forget();
-    paste.forget();
-    unload.forget();
-    hashchange.forget();
-    listen_touch(screen);
-}
-
-/// A phone or tablet: no physical keyboard to expect.
-fn touch() -> bool {
-    window().match_media("(hover: none) and (pointer: coarse)").ok().flatten().is_some_and(|m| m.matches())
-}
-
-fn element<T: JsCast>(id: &str) -> Option<T> {
-    window().document()?.get_element_by_id(id)?.dyn_into().ok()
-}
-
-/// The pointer under a finger or mouse, from press to release.
-#[derive(Default)]
-struct Press {
-    id: i32,
-    touch: bool,
-    x: f64,
-    y: f64,
-    /// Where the last whole row of scrolling was taken, in pixels.
-    scrolled_y: f64,
-    moved: bool,
-    /// A long press already opened the menu.
-    held: bool,
-    timer: Option<i32>,
-}
-
-#[derive(Default)]
-struct Gestures {
-    press: Option<Press>,
-    /// Time and cell of the last tap, to notice a double tap.
-    last_tap: Option<(f64, u16, u16)>,
-}
-
-const MOVE_SLOP: f64 = 10.0;
-const LONG_PRESS_MS: i32 = 500;
-const DOUBLE_TAP_MS: f64 = 350.0;
-const SWIPE_MIN: f64 = 60.0;
-
-/// The grid cell under a point, and the height of a cell in pixels.
-fn cell_at(x: f64, y: f64) -> Option<(u16, u16, f64)> {
-    let grid = window().document()?.get_element_by_id(Grid::ID)?;
-    let rows = grid.child_element_count();
-    let cols = grid.first_element_child()?.child_element_count();
-    let r = grid.get_bounding_client_rect();
-    if rows == 0 || cols == 0 || r.width() <= 0.0 {
-        return None;
-    }
-    let (cw, ch) = (r.width() / cols as f64, r.height() / rows as f64);
-    let col = ((x - r.left()) / cw).floor().clamp(0.0, cols as f64 - 1.0) as u16;
-    let row = ((y - r.top()) / ch).floor().clamp(0.0, rows as f64 - 1.0) as u16;
-    Some((col, row, ch))
-}
-
-/// A tap on a screen before the app: sign in, pick a repo, or press a hint's key.
-fn tap_screen(screen: &Shared, col: u16, row: u16) {
-    let p = Position::new(col, row);
-    let Some(tap) = TAPS.with(|t| t.borrow().iter().rev().find(|(r, _)| r.contains(p)).map(|(_, t)| t.clone())) else {
-        return;
-    };
-    match tap {
-        Tap::Key(k) => {
-            handle(screen, k);
-        }
-        Tap::Repo(i) => {
-            if let Screen::Repos { sel, .. } = &mut *screen.borrow_mut() {
-                *sel = i;
-            }
-            handle(screen, Input { key: Key::Enter, ..Input::default() });
-        }
-    }
-}
-
-/// Runs `f` on the app if it's open; otherwise lets the screen take a tap.
-fn with_app(screen: &Shared, f: impl FnOnce(&mut App)) -> bool {
-    match &mut *screen.borrow_mut() {
-        Screen::App(app, _) => {
-            f(app);
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Phones: shows the on-screen keyboard while there's something to type into, and hides it
-/// otherwise. Runs inside the touch or key handler, as iOS only opens it from one.
-fn fit_keyboard(screen: &Shared) {
-    if !touch() {
-        return;
-    }
-    let Some(kbd) = element::<HtmlTextAreaElement>("kbd") else { return };
-    let wants = matches!(&*screen.borrow(), Screen::App(app, _) if app.wants_text());
-    let focused = window().document().and_then(|d| d.active_element()).is_some_and(|f| f.is_same_node(Some(&kbd)));
-    if wants && !focused {
-        let _ = kbd.focus();
-    } else if !wants && focused {
-        let _ = kbd.blur();
-    }
-}
-
-/// Touch and mouse: tap, double tap, long press, drag to scroll and swipe for the tree,
-/// plus the mouse wheel. The on-screen keyboard and the visual viewport on phones.
-fn listen_touch(screen: &Shared) {
-    let w = window();
-    let Some(term) = element::<HtmlElement>("term") else { return };
-    let gestures: Rc<RefCell<Gestures>> = Rc::default();
-
-    let s = screen.clone();
-    let g = gestures.clone();
-    let down = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+    dom::on(target, "click", |e: MouseEvent| {
         if e.button() != 0 {
             return;
         }
-        // Keeps the focus (and so the keyboard) where it is; taps are handled on release.
-        e.prevent_default();
-        let touch = e.pointer_type() != "mouse";
-        // A mouse drag that leaves the grid still selects up to its edge, and its release still arrives.
-        if !touch && let Some(t) = e.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-            let _ = t.set_pointer_capture(e.pointer_id());
-        }
-        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
-        let mut press = Press { id: e.pointer_id(), touch, x, y, scrolled_y: y, ..Press::default() };
-        if touch {
-            let s = s.clone();
-            let g2 = g.clone();
-            let hold = Closure::once_into_js(move || {
-                let mut gs = g2.borrow_mut();
-                let Some(p) = gs.press.as_mut().filter(|p| !p.moved) else { return };
-                p.held = true;
-                p.timer = None;
-                let (x, y) = (p.x, p.y);
-                drop(gs);
-                if let Some((col, row, _)) = cell_at(x, y) {
-                    redraw();
-                    with_app(&s, |app| app.long_press(col, row));
-                    fit_keyboard(&s);
-                }
-            });
-            press.timer = window()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(hold.unchecked_ref(), LONG_PRESS_MS)
-                .ok();
-        }
-        g.borrow_mut().press = Some(press);
-    });
-
-    let s = screen.clone();
-    let g = gestures.clone();
-    let mv = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
-        let mut gs = g.borrow_mut();
-        let Some(p) = gs.press.as_mut().filter(|p| p.id == e.pointer_id()) else { return };
-        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
-        if !p.moved && (x - p.x).hypot(y - p.y) > MOVE_SLOP {
-            p.moved = true;
-            if let Some(t) = p.timer.take() {
-                window().clear_timeout_with_handle(t);
+        let then = try_with(|s| match s {
+            Screen::Notebook(nb) => {
+                nb.click(&e);
+                Then::Nothing
             }
-        }
-        // A mouse drag selects text.
-        if !p.touch {
-            if !p.moved {
-                return;
-            }
-            let (Some((c0, r0, _)), Some((c1, r1, _))) = (cell_at(p.x, p.y), cell_at(x, y)) else { return };
-            drop(gs);
-            with_app(&s, |app| app.drag((c0, r0), (c1, r1)));
-            return;
-        }
-        // A vertical drag scrolls what's under the finger, a row at a time.
-        if !p.touch || !p.moved || p.held || (x - p.x).abs() > (y - p.y).abs() {
-            return;
-        }
-        let Some((col, row, ch)) = cell_at(p.x, p.y) else { return };
-        let rows = ((p.scrolled_y - y) / ch).trunc();
-        if rows != 0.0 {
-            p.scrolled_y -= rows * ch;
-            drop(gs);
-            with_app(&s, |app| app.scroll(col, row, rows as isize));
-        }
-    });
-
-    let s = screen.clone();
-    let g = gestures.clone();
-    let up = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
-        let mut gs = g.borrow_mut();
-        let Some(p) = gs.press.take().filter(|p| p.id == e.pointer_id()) else { return };
-        if let Some(t) = p.timer {
-            window().clear_timeout_with_handle(t);
-        }
-        if p.held {
-            return;
-        }
-        let (x, y) = (e.client_x() as f64, e.client_y() as f64);
-        let (dx, dy) = (x - p.x, y - p.y);
-        if p.moved {
-            drop(gs);
-            if !p.touch {
-                with_app(&s, |app| app.drag_end());
-            } else if dx.abs() > SWIPE_MIN && dx.abs() > 2.0 * dy.abs() {
-                with_app(&s, |app| app.swipe(dx > 0.0));
-            }
-            return fit_keyboard(&s);
-        }
-        let Some((col, row, _)) = cell_at(p.x, p.y) else { return };
-        let now = js_sys::Date::now();
-        let double = gs
-            .last_tap
-            .is_some_and(|(t, c, r)| now - t < DOUBLE_TAP_MS && c.abs_diff(col) <= 1 && r.abs_diff(row) <= 1);
-        gs.last_tap = if double { None } else { Some((now, col, row)) };
-        drop(gs);
-        let handled = with_app(&s, |app| if double { app.double_tap(col, row) } else { app.tap(col, row) });
-        if !handled {
-            tap_screen(&s, col, row);
-        }
-        fit_keyboard(&s);
-    });
-
-    let g = gestures.clone();
-    let cancel = Closure::<dyn FnMut(PointerEvent)>::new(move |_: PointerEvent| {
-        if let Some(t) = g.borrow_mut().press.take().and_then(|p| p.timer) {
-            window().clear_timeout_with_handle(t);
-        }
-    });
-
-    let s = screen.clone();
-    let wheel = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
-        let Some((col, row, ch)) = cell_at(e.client_x() as f64, e.client_y() as f64) else { return };
-        e.prevent_default();
-        let px = match e.delta_mode() {
-            WheelEvent::DOM_DELTA_LINE => e.delta_y() * ch,
-            WheelEvent::DOM_DELTA_PAGE => e.delta_y() * ch * 20.0,
-            _ => e.delta_y(),
-        };
-        let rows = (px / ch).round().clamp(-10.0, 10.0) as isize;
-        let rows = if rows == 0 { px.signum() as isize } else { rows };
-        with_app(&s, |app| app.scroll(col, row, rows));
-    });
-
-    // A right click is the long press of a mouse.
-    let s = screen.clone();
-    let context = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let Some((col, row, _)) = cell_at(e.client_x() as f64, e.client_y() as f64) else { return };
-        if with_app(&s, |app| app.long_press(col, row)) {
-            e.prevent_default();
-        }
-    });
-
-    let on = |name: &str, f: &JsValue| {
-        let _ = term.add_event_listener_with_callback(name, f.unchecked_ref());
-    };
-    on("pointerdown", down.as_ref());
-    on("pointermove", mv.as_ref());
-    on("pointerup", up.as_ref());
-    on("pointercancel", cancel.as_ref());
-    on("contextmenu", context.as_ref());
-    let opts = web_sys::AddEventListenerOptions::new();
-    opts.set_passive(false);
-    let _ = term.add_event_listener_with_callback_and_add_event_listener_options(
-        "wheel",
-        wheel.as_ref().unchecked_ref(),
-        &opts,
-    );
-    // iOS Safari ignores the viewport's no-zoom settings and can still zoom on a double tap
-    // or a pinch. Taps and gestures are gition's, so cancel the browser's.
-    let no_zoom = Closure::<dyn FnMut(Event)>::new(|e: Event| e.prevent_default());
-    if let Some(doc) = w.document() {
-        for name in ["touchend", "dblclick", "gesturestart"] {
-            let _ = doc.add_event_listener_with_callback_and_add_event_listener_options(
-                name,
-                no_zoom.as_ref().unchecked_ref(),
-                &opts,
-            );
-        }
-    }
-    no_zoom.forget();
-    down.forget();
-    mv.forget();
-    up.forget();
-    cancel.forget();
-    wheel.forget();
-    context.forget();
-
-    // Typing on the on-screen keyboard. Keys with a real `key` already arrived as keydown and
-    // were cancelled there; this catches the rest (predictive text, autocorrect, dictation).
-    if let Some(kbd) = element::<HtmlTextAreaElement>("kbd") {
-        let s = screen.clone();
-        let k = kbd.clone();
-        let input = Closure::<dyn FnMut(InputEvent)>::new(move |e: InputEvent| {
-            if e.is_composing() {
-                return;
-            }
-            e.prevent_default();
-            let keys: Vec<Key> = match e.input_type().as_str() {
-                "insertText" | "insertReplacementText" => e.data().unwrap_or_default().chars().map(Key::Char).collect(),
-                "insertLineBreak" | "insertParagraph" => vec![Key::Enter],
-                "deleteContentBackward" => vec![Key::Backspace],
-                "deleteContentForward" => vec![Key::Delete],
-                _ => vec![],
-            };
-            for key in keys {
-                handle(&s, Input { key, ..Input::default() });
-            }
-            k.set_value("");
-            fit_keyboard(&s);
+            other => match closest(e.target(), "[data-act]") {
+                Some(el) => screen_click(other, &data(&el, "act").unwrap_or_default(), &el),
+                None => Then::Nothing,
+            },
         });
-        let _ = kbd.add_event_listener_with_callback("beforeinput", input.as_ref().unchecked_ref());
-        input.forget();
+        run(then.unwrap_or(Then::Nothing));
+    });
+
+    dom::on(target, "keydown", |e: KeyboardEvent| {
+        let used = try_with(|s| match s {
+            Screen::Notebook(nb) => nb.keydown(&e),
+            Screen::Login if e.key() == "Enter" => {
+                let _ = window().location().assign("/auth/login");
+                true
+            }
+            _ => false,
+        });
+        if used == Some(true) {
+            e.prevent_default();
+        }
+    });
+
+    dom::on(target, "input", |e: Event| with_notebook(|nb| nb.input(&e)));
+    dom::on(target, "paste", |e: ClipboardEvent| with_notebook(|nb| nb.paste(&e)));
+
+    // Editing ends when the focus leaves the block, but not halfway through a click: that
+    // click may land on another block, which is found before this one is redrawn.
+    dom::on(target, "focusout", |_: Event| {
+        dom::timeout(0, || {
+            if !PRESSING.with(Cell::get) {
+                with_notebook(|nb| nb.focus_left());
+            }
+        });
+    });
+    dom::on(target, "pointerdown", |_: Event| PRESSING.with(|p| p.set(true)));
+    for name in ["pointerup", "pointercancel"] {
+        dom::on(target, name, |_: Event| {
+            PRESSING.with(|p| p.set(false));
+            dom::timeout(0, || with_notebook(|nb| nb.focus_left()));
+        });
     }
 
-    // The on-screen keyboard shrinks the visual viewport only: fit the page to it, and tell
-    // the DOM backend to rebuild its grid (it listens for window resizes).
+    let w = window();
+    // Saved edits are in the working copy; keep it when the tab goes away.
+    let keep = || {
+        try_with(|s| {
+            if let Screen::Notebook(nb) = s {
+                nb.persist();
+            }
+        });
+    };
+    dom::on(w.as_ref(), "beforeunload", move |_: Event| keep());
+    dom::on(target, "visibilitychange", move |_: Event| keep());
+    dom::on(w.as_ref(), "hashchange", |_: Event| {
+        let _ = window().location().reload();
+    });
+    // The on-screen keyboard shrinks only the visual viewport: fit the page to it.
     if let Some(vv) = w.visual_viewport() {
-        let fit = Closure::<dyn FnMut()>::new(move || {
+        dom::on(vv.as_ref(), "resize", |_: Event| {
             let w = window();
-            let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else {
-                return;
-            };
+            let (Some(vv), Some(body)) = (w.visual_viewport(), w.document().and_then(|d| d.body())) else { return };
             // While zoomed in, the visual viewport is the zoomed area, not the keyboard's room.
             if (vv.scale() - 1.0).abs() > 0.01 {
                 return;
             }
-            // The keyboard covers the home indicator, so no room is needed for it then.
-            let inner = w.inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(0.0);
-            let bottom = if inner - vv.height() > 100.0 { "0px" } else { "env(safe-area-inset-bottom)" };
-            let _ = body.style().set_property("padding-bottom", bottom);
-            let height = format!("{}px", vv.height());
-            if body.style().get_property_value("height").ok().as_deref() != Some(height.as_str()) {
-                let _ = body.style().set_property("height", &height);
-                w.scroll_to_with_x_and_y(0.0, 0.0);
-                if let Ok(e) = Event::new("resize") {
-                    let _ = w.dispatch_event(&e);
-                }
-            }
+            let _ = body.style().set_property("height", &format!("{}px", vv.height()));
         });
-        let _ = vv.add_event_listener_with_callback("resize", fit.as_ref().unchecked_ref());
-        fit.forget();
-    }
-}
-
-// ---- drawing ------------------------------------------------------------------
-
-/// `DomBackend`, but reporting the size of the grid it actually built. Ratzilla 0.3's
-/// `size()` guesses from the window (or, on phones, the whole screen), which is bigger than
-/// the grid and made the first frame write past its end.
-struct Grid {
-    dom: DomBackend,
-    /// The grid element of the last frame, to notice when the backend rebuilt it.
-    grid: Option<web_sys::Element>,
-    /// The size a rebuild was last forced for, so a rounding difference can't force one each frame.
-    forced: Option<Size>,
-}
-
-impl Grid {
-    const ID: &str = "term_ratzilla_grid";
-
-    /// Lets the backend (re)build its grid, which it does lazily on the first draw and after
-    /// a resize. True when it did, so the whole screen needs drawing again.
-    fn sync(&mut self) -> bool {
-        // The backend measures the page when it's created but builds the grid on the first
-        // frame, and forgets a resize in between: a tab opened in the background, where frames
-        // wait, kept a grid sized for another window. Rebuild whenever it doesn't fit.
-        let fits = self.fitting_size();
-        if self.grid.is_some() && fits.is_some() && self.drawn_size() != fits && self.forced != fits {
-            self.forced = fits;
-            if let Ok(e) = Event::new("resize") {
-                let _ = window().dispatch_event(&e);
-            }
-        }
-        let _ = self.dom.draw(std::iter::empty());
-        let grid = window().document().and_then(|d| d.get_element_by_id(Self::ID));
-        let rebuilt = grid != self.grid;
-        self.grid = grid;
-        rebuilt
-    }
-
-    /// The grid that fits the page now, worked out as the backend does.
-    fn fitting_size(&self) -> Option<Size> {
-        let term = window().document()?.get_element_by_id("term")?.get_bounding_client_rect();
-        let (w, h) = self.dom.cell_size_css_px();
-        let size = Size::new((term.width() / f64::from(w)) as u16, (term.height() / f64::from(h)) as u16);
-        Some(size).filter(|s| s.width > 0 && s.height > 0)
-    }
-
-    fn drawn_size(&self) -> Option<Size> {
-        let grid = self.grid.as_ref()?;
-        let cols = grid.first_element_child()?.child_element_count() as u16;
-        Some(Size::new(cols, grid.child_element_count() as u16)).filter(|s| s.width > 0)
-    }
-}
-
-impl Backend for Grid {
-    type Error = std::io::Error;
-
-    fn draw<'a, I: Iterator<Item = (u16, u16, &'a Cell)>>(&mut self, content: I) -> std::io::Result<()> {
-        // Cells outside the grid have nowhere to go.
-        let size = self.size()?;
-        self.dom.draw(content.filter(|(x, y, _)| *x < size.width && *y < size.height))
-    }
-    fn hide_cursor(&mut self) -> std::io::Result<()> {
-        self.dom.hide_cursor()
-    }
-    fn show_cursor(&mut self) -> std::io::Result<()> {
-        self.dom.show_cursor()
-    }
-    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
-        self.dom.get_cursor_position()
-    }
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
-        self.dom.set_cursor_position(position)
-    }
-    fn clear(&mut self) -> std::io::Result<()> {
-        self.dom.clear()
-    }
-    fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
-        self.dom.clear_region(clear_type)
-    }
-    fn size(&self) -> std::io::Result<Size> {
-        Ok(self.drawn_size().unwrap_or_default())
-    }
-    fn window_size(&mut self) -> std::io::Result<WindowSize> {
-        self.dom.window_size()
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.dom.flush()
-    }
-}
-
-fn draw(f: &mut Frame, screen: &Shared) {
-    draw_screen(f, screen);
-    for cell in f.buffer_mut().content.iter_mut() {
-        cell.fg = theme(cell.fg, false);
-        // Reset is transparent, so the image under the grid shows through.
-        cell.bg = if cell.bg == images::SLOT { Color::Reset } else { theme(cell.bg, true) };
-    }
-}
-
-/// Applies what arrived since the last frame: picked and pasted images, loaded images,
-/// finished background work. Returns whether any of it changed the app. `cell` is in pixels.
-fn prepare(screen: &Shared, cell: (f32, f32)) -> bool {
-    let Screen::App(app, ctx) = &mut *screen.borrow_mut() else { return false };
-    let picked: Vec<_> = ctx.picked.borrow_mut().drain(..).collect();
-    let pasted: Vec<_> = ctx.pasted.borrow_mut().drain(..).collect();
-    let arrived = ctx.pictures.take_arrived();
-    let mut changed = !picked.is_empty() || !pasted.is_empty() || !arrived.is_empty();
-    if app.images.set_cell_size(cell) || !arrived.is_empty() {
-        app.relayout();
-        changed = true;
-    }
-    for (path, size) in arrived {
-        app.images.loaded(path, size);
-    }
-    for (name, bytes) in picked {
-        app.insert_image_data(&name, &bytes);
-    }
-    for images in pasted {
-        app.paste_images(images);
-    }
-    changed |= app.tick();
-    for path in app.images.take_wanted() {
-        Pictures::want(ctx, path);
-    }
-    ctx.persist();
-    if app.quit {
-        // Quitting leaves the repo for the repo list; the working copy is saved above.
-        app.quit = false;
-        let _ = window().location().assign("/#repos");
-        let _ = window().location().reload();
-    }
-    changed
-}
-
-/// Puts the images where the last frame left slots for them. `cell` is in CSS pixels.
-fn show_pictures(screen: &Shared, cell: (f32, f32)) {
-    let mut s = screen.borrow_mut();
-    match &mut *s {
-        Screen::App(app, ctx) => ctx.pictures.place(ctx, &app.images.take_shown(), cell),
-        _ => {
-            if let Some(layer) = window().document().and_then(|d| d.get_element_by_id("pics")) {
-                layer.set_inner_html("");
-            }
-        }
-    }
-}
-
-fn draw_screen(f: &mut Frame, screen: &Shared) {
-    let mut s = screen.borrow_mut();
-    let hint = |t: &str| Line::styled(t.to_string(), Style::new().fg(Color::DarkGray));
-    TAPS.with(|t| t.borrow_mut().clear());
-    match &mut *s {
-        Screen::App(app, _) => gition::ui::draw(f, app),
-        Screen::Message(m) => {
-            dialog(f, "gition", vec![Line::raw(m.clone())]);
-        }
-        Screen::Error(m) => {
-            const HINT: &str = "Enter reload · p pick another repository";
-            let rows = dialog(
-                f,
-                "gition",
-                vec![Line::styled(m.clone(), Style::new().fg(Color::Red)), Line::raw(""), hint(HINT)],
-            );
-            hint_taps(rows.last(), HINT);
-        }
-        Screen::Login => {
-            add_tap(f.area(), Tap::Key(Input { key: Key::Enter, ..Input::default() }));
-            dialog(
-                f,
-                "gition",
-                vec![
-                    Line::raw("A notebook stored as markdown in a GitHub repo."),
-                    Line::raw(""),
-                    Line::styled(
-                        if touch() { "Tap to sign in with GitHub" } else { "Press Enter to sign in with GitHub" },
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                    Line::raw(""),
-                    hint("Notes go straight from your browser to GitHub; this server stores nothing."),
-                    hint("gition only sees the repos you install the app on."),
-                ],
-            );
-        }
-        Screen::Repos { repos, sel, .. } => {
-            let mut lines = vec![Line::raw("Open a repository:"), Line::raw("")];
-            if repos.is_empty() {
-                lines.push(Line::raw("No repositories yet. Install the gition app on one."));
-            }
-            let max = f.area().height.saturating_sub(10) as usize;
-            let start = sel.saturating_sub(max.saturating_sub(1));
-            let mut shown = Vec::new();
-            for (i, r) in repos.iter().enumerate().skip(start).take(max.max(1)) {
-                let style = if i == *sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
-                shown.push((lines.len(), i));
-                lines.push(Line::styled(format!(" {r} "), style));
-            }
-            lines.push(Line::raw(""));
-            const HINT: &str = "j/k move · Enter open · i add repositories · r refresh";
-            lines.push(hint(HINT));
-            let rows = dialog(f, "gition", lines);
-            for (line, i) in shown {
-                if let Some(&r) = rows.get(line) {
-                    add_tap(r, Tap::Repo(i));
-                }
-            }
-            hint_taps(rows.last(), HINT);
-        }
-        Screen::Empty { full_name, .. } => {
-            const HINT: &str = "y commit · n pick another repository";
-            let rows = dialog(
-                f,
-                "gition",
-                vec![
-                    Line::raw(format!("{full_name} is empty.")),
-                    Line::raw("Commit a first page to start a gition workspace?"),
-                    Line::raw(""),
-                    hint(HINT),
-                ],
-            );
-            hint_taps(rows.last(), HINT);
-        }
-    }
-}
-
-/// Terminals map the 16 named colors through their theme; the browser has none, so pick one
-/// that reads well on the dark page background.
-fn theme(c: Color, bg: bool) -> Color {
-    let rgb = |r, g, b| Color::Rgb(r, g, b);
-    match c {
-        Color::Reset if bg => rgb(15, 17, 21),
-        Color::Reset => rgb(216, 222, 233),
-        Color::Black => rgb(46, 52, 64),
-        Color::Red => rgb(191, 97, 106),
-        Color::Green => rgb(163, 190, 140),
-        Color::Yellow => rgb(235, 203, 139),
-        Color::Blue => rgb(129, 161, 193),
-        Color::Magenta => rgb(180, 142, 173),
-        Color::Cyan => rgb(136, 192, 208),
-        Color::Gray => rgb(216, 222, 233),
-        Color::DarkGray => rgb(118, 126, 142),
-        Color::LightRed => rgb(208, 135, 112),
-        Color::LightGreen => rgb(183, 210, 160),
-        Color::LightYellow => rgb(245, 220, 160),
-        Color::LightBlue => rgb(150, 185, 215),
-        Color::LightMagenta => rgb(200, 162, 193),
-        Color::LightCyan => rgb(160, 215, 230),
-        Color::White => rgb(236, 239, 244),
-        other => other,
-    }
-}
-
-/// Draws a centered box; returns where each line went.
-fn dialog(f: &mut Frame, title: &str, lines: Vec<Line>) -> Vec<Rect> {
-    let area = f.area();
-    let w = 72.min(area.width);
-    // Count wrapped rows so narrow screens don't cut the last lines off.
-    let inner = w.saturating_sub(2).max(1) as usize;
-    let heights: Vec<u16> = lines.iter().map(|l| l.width().div_ceil(inner).max(1) as u16).collect();
-    let h = (heights.iter().sum::<u16>() + 2).min(area.height);
-    let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 3, w, h);
-    f.render_widget(Clear, r);
-    let block = Block::bordered().title(format!(" {title} ")).border_style(Style::new().fg(Color::Cyan));
-    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), r);
-    let mut y = r.y + 1;
-    heights
-        .iter()
-        .map(|&h| {
-            let line = Rect::new(r.x + 1, y, inner as u16, h);
-            y += h;
-            line
-        })
-        .collect()
-}
-
-/// What a tap on the screens before the app does.
-#[derive(Clone)]
-enum Tap {
-    Key(Input),
-    Repo(usize),
-}
-
-thread_local! {
-    /// Filled while drawing those screens.
-    static TAPS: RefCell<Vec<(Rect, Tap)>> = const { RefCell::new(Vec::new()) };
-}
-
-fn add_tap(r: Rect, tap: Tap) {
-    TAPS.with(|t| t.borrow_mut().push((r, tap)));
-}
-
-/// Makes each segment of a hint line like "y create · n pick" press its key.
-fn hint_taps(line: Option<&Rect>, text: &str) {
-    let Some(line) = line else { return };
-    let mut x = line.x;
-    for seg in text.split(" · ") {
-        let w = Line::raw(seg).width() as u16;
-        if let Some(k) = gition::pointer::hint_key(seg) {
-            add_tap(Rect::new(x, line.y, w, 1), Tap::Key(k));
-        }
-        x += w + 3;
     }
 }
