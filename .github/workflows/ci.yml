@@ -51,7 +51,8 @@ jobs:
             web
       - uses: taiki-e/install-action@v2
         with:
-          tool: trunk,worker-build
+          # worker-build must match the `worker` crate in web/server: 0.9 refuses worker 0.8.
+          tool: trunk,worker-build@0.8.7
       - name: Shared code builds without the terminal frontend
         run: cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
       - working-directory: web

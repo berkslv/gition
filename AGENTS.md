@@ -7,7 +7,7 @@ gition is a Rust TUI notebook: a markdown page tree, a viewer and an editor, wit
 - `cargo test`: unit tests, plus integration tests in `tests/`. The integration tests need `git` on PATH.
 - `cargo clippy --all-targets` and `cargo fmt`. Formatting uses `rustfmt.toml` (width 120).
 - `cargo clippy --lib --no-default-features --target wasm32-unknown-unknown` checks that the shared code builds for the web.
-- In `web/`: `cargo clippy --target wasm32-unknown-unknown --all-targets`. To run it locally, build with `trunk build --release` in `web/client` and `worker-build --release` in `web/server`, then run `npx wrangler dev` in `web/`. Restart `wrangler dev` after each rebuild, because it snapshots the asset list. This needs `cargo install trunk worker-build` and a `web/.dev.vars` with the secrets.
+- In `web/`: `cargo clippy --target wasm32-unknown-unknown --all-targets`. To run it locally, build with `trunk build --release` in `web/client` and `worker-build --release` in `web/server`, then run `npx wrangler dev` in `web/`. Restart `wrangler dev` after each rebuild, because it snapshots the asset list. This needs `cargo install trunk worker-build@0.8.7` (its version must match the `worker` crate in `web/server`; CI pins the same one) and a `web/.dev.vars` with the secrets.
 - UI snapshots live in `tests/snapshots/`. Review changes with `cargo insta review`, or regenerate them with `INSTA_UPDATE=always cargo test`.
 
 ## Releasing
