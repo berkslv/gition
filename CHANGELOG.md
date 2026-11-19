@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+- Web: a new interface made for the browser, like Notion, instead of a copy of the terminal. Pages are always editable: there's no separate viewer and editor. Click any block to edit its markdown in place, and it shows rendered again when you leave it. Enter starts a new block and continues lists, Backspace joins blocks, and task boxes tick with a click.
+- Web: changes save as you type. Sync is the only thing that commits.
+- Web: a sidebar with the page tree and a menu on each page to add, rename, move or delete pages. Adding a page inside another turns it into a folder and keeps links working. On phones the sidebar is a drawer.
+- Web: a dark theme in gition's colors. Pick Light, Dark or System from the ⋯ menu; System follows the device.
+
+### Changed
+- Web: images are added by pasting them into a page.
+- The terminal app is unchanged. Page operations (new pages, rename/move, turning a page into a folder, saving images) now live in shared code used by both.
+
 ## 0.3.1
 
 ### Fixed
